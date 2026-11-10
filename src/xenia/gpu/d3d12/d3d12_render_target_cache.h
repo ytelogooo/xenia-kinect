@@ -95,6 +95,33 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
                reg::RB_COPY_DEST_INFO* copy_dest_info_out = nullptr,
                bool* written_scaled_out = nullptr);
 
+  // Resolves every rectangle of a copy-mode rectangle list draw (see
+  // draw_util::ResolveRectangle) with as few GPU barriers as possible: all the
+  // render target dumps first, then all the copies, instead of switching the
+  // EDRAM buffer and shared memory states around every rectangle. Gives the
+  // same result as resolving the rectangles one by one, so it's only done when
+  // that is guaranteed - host render targets, no resolution scaling, and with
+  // clears, only if no rectangle overlaps another; returns false without doing
+  // anything otherwise (resolve them one by one then). written_ranges_out receives (address, length) of every rectangle
+  // written to shared memory, in order.
+  // Why ResolveRectangles didn't batch (for the statistics).
+  enum class ResolveRectanglesFallback : uint32_t {
+    kNone,
+    kNotApplicable,
+    kInfo,
+    kClearOtherRegion,
+    kNativeLayout,
+    kShader,
+    kOverlap,
+    kCount,
+  };
+  bool ResolveRectangles(
+      const Memory& memory, D3D12SharedMemory& shared_memory,
+      D3D12TextureCache& texture_cache,
+      const draw_util::ResolveRectangle& layout, uint32_t rectangle_count,
+      std::vector<std::pair<uint32_t, uint32_t>>& written_ranges_out,
+      ResolveRectanglesFallback& fallback_out);
+
   // Returns true if any downloads were submitted to the command processor.
   bool InitializeTraceSubmitDownloads();
   void InitializeTraceCompleteDownloads();
@@ -813,6 +840,18 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
   std::vector<DumpInvocation> dump_invocations_;
+  // For ResolveRectangles.
+  struct BatchedResolve {
+    draw_util::ResolveInfo info;
+    draw_util::ResolveCopyShaderConstants constants;
+    draw_util::ResolveCopyShaderIndex shader;
+    uint32_t group_count_x;
+    uint32_t group_count_y;
+    bool copy;
+    // Covered EDRAM samples relative to the original base, [x0, x1) x [y0, y1).
+    uint32_t x0, y0, x1, y1;
+  };
+  std::vector<BatchedResolve> batched_resolves_;
 
   ID3D12RootSignature* dump_root_signature_color_ = nullptr;
   ID3D12RootSignature* dump_root_signature_depth_ = nullptr;

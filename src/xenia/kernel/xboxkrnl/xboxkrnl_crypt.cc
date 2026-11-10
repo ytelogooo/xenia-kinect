@@ -8,7 +8,20 @@
 */
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <fstream>
+#include <set>
+#include <sstream>
+#include <string>
+#include <atomic>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <vector>
 
+#include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #include "xenia/kernel/kernel_state.h"
@@ -29,6 +42,12 @@ extern "C" {
 #include "third_party/FFmpeg/libavutil/sha512.h"
 #include "third_party/aes_128/aes.h"
 }
+
+DEFINE_string(title_key_file, "title_keys.txt",
+              "File with results for title-derived key slots 0xE0-0xE8 "
+              "(XeKeysSetKey/XeKeysAesCbc), relative to Xenia's folder. See "
+              "xboxkrnl_crypt.cc for the format.",
+              "Kernel");
 
 namespace xe {
 namespace kernel {
@@ -1087,6 +1106,279 @@ dword_result_t XeKeysAesCbcUsingKey_entry(lpvoid_t obscured_key,
   return X_STATUS_SUCCESS;
 }
 DECLARE_XBOXKRNL_EXPORT1(XeKeysAesCbcUsingKey, kNone, kImplemented);
+
+// Keys set by titles with XeKeysSetKey. For the title key slots 0xE0-0xE8
+// the hypervisor does not store the title's key as given: it derives the key
+// with HMAC-SHA1 over console secrets Xenia doesn't have (Harmonix titles
+// decrypt their song audio keys this way). Results for those slots can be
+// supplied in title_key_file, e.g. obtained from the user's own console:
+//   KEY E0 <key the title sets, 32 hex> <derived key, 32 hex>
+//   CBC E0 <key the title sets> <decrypt|encrypt> <input hex> <output hex>
+// (CBC lines: exact result of one call, initialisation vector 0.) Calls that
+// can't be answered are listed in title_keys_needed.txt next to Xenia.
+// Other key numbers are stored and used as given.
+
+namespace {
+
+std::mutex title_keys_mutex;
+std::map<uint16_t, std::vector<uint8_t>> title_keys;
+// "E0 <set key>" -> derived key.
+std::map<std::string, std::vector<uint8_t>> derived_keys;
+// "E0 <set key> decrypt <input>" -> output.
+std::map<std::string, std::vector<uint8_t>> cbc_results;
+std::set<std::string> reported_needs;
+bool title_key_file_loaded = false;
+
+bool IsTitleKeySlot(uint16_t key_num) {
+  return key_num >= 0xE0 && key_num <= 0xE8;
+}
+
+std::string ToHex(const uint8_t* data, size_t size) {
+  static const char digits[] = "0123456789ABCDEF";
+  std::string text;
+  text.reserve(size * 2);
+  for (size_t i = 0; i < size; ++i) {
+    text += digits[data[i] >> 4];
+    text += digits[data[i] & 15];
+  }
+  return text;
+}
+
+bool FromHex(const std::string& text, std::vector<uint8_t>* out) {
+  if (text.size() % 2) {
+    return false;
+  }
+  out->clear();
+  for (size_t i = 0; i < text.size(); i += 2) {
+    char* end = nullptr;
+    const std::string pair = text.substr(i, 2);
+    const unsigned long value = std::strtoul(pair.c_str(), &end, 16);
+    if (!end || *end) {
+      return false;
+    }
+    out->push_back(uint8_t(value));
+  }
+  return true;
+}
+
+std::string UpperCase(std::string text) {
+  for (char& c : text) {
+    c = char(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return text;
+}
+
+std::filesystem::path TitleKeyPath(const std::filesystem::path& name) {
+  return name.is_absolute() ? name
+                            : xe::filesystem::GetExecutableFolder() / name;
+}
+
+// Built in, so no title_keys.txt is needed for them: the keys Harmonix
+// titles hand the console for their songs (mogg versions 12-13, 14, 15 and
+// 16; Dance Central 2 and 3 set them in slot E0) and the keys the console
+// derives from them, which the songs decrypt with (from dcwestra/xenia-edge;
+// mogg tools carry them too). Checked against Dance Central 3: all 50 song
+// answers in a title_keys.txt from a console match. A title_keys.txt still
+// overrides them.
+struct BuiltInTitleKey {
+  const char* set;
+  const char* derived;
+};
+constexpr BuiltInTitleKey kBuiltInTitleKeys[] = {
+    {"6D85A8998B2D1C76FADE68F2AF3802ED", "01220038D201788BDDCDD0F0FE3E247F"},
+    {"B23E8DAC464997DE21DB31C4331B756A", "5173ADE5B399B861581AF9B81EA7BEBF"},
+    {"BB7C64B64A6E19E9CC30BD5D0B2080B4", "C6229430D83C841408737CF223F6EB5A"},
+    {"1F552165972FE5AF27D2D4F45E93D19D", "021A83F397E9D4B806746B304C000091"},
+};
+
+// Called with title_keys_mutex held.
+void LoadTitleKeyFile() {
+  if (title_key_file_loaded) {
+    return;
+  }
+  title_key_file_loaded = true;
+  for (uint16_t slot = 0xE0; slot <= 0xE8; ++slot) {
+    char slot_text[8];
+    std::snprintf(slot_text, sizeof(slot_text), "%02X", slot);
+    for (const BuiltInTitleKey& key : kBuiltInTitleKeys) {
+      std::vector<uint8_t> bytes;
+      if (FromHex(key.derived, &bytes)) {
+        derived_keys[std::string(slot_text) + " " + key.set] = bytes;
+      }
+    }
+  }
+  XELOGI("XeKeys: {} built-in Harmonix song keys",
+         sizeof(kBuiltInTitleKeys) / sizeof(kBuiltInTitleKeys[0]));
+  const std::string name = cvars::title_key_file;
+  if (name.empty()) {
+    return;
+  }
+  const std::filesystem::path path = TitleKeyPath(name);
+  std::ifstream file(path);
+  if (!file) {
+    XELOGI("XeKeys: no title key file ({})", xe::path_to_utf8(path));
+    return;
+  }
+  std::string line;
+  uint32_t keys = 0, results = 0;
+  while (std::getline(file, line)) {
+    const size_t comment = line.find('#');
+    if (comment != std::string::npos) {
+      line.resize(comment);
+    }
+    std::istringstream words(line);
+    std::string kind, slot, set_key, a, b, c;
+    words >> kind >> slot >> set_key >> a >> b >> c;
+    kind = UpperCase(kind);
+    slot = UpperCase(slot);
+    set_key = UpperCase(set_key);
+    std::vector<uint8_t> bytes;
+    if (kind == "KEY" && FromHex(a, &bytes) && bytes.size() == 16) {
+      derived_keys[slot + " " + set_key] = bytes;
+      ++keys;
+    } else if (kind == "CBC" && !b.empty() && FromHex(c, &bytes)) {
+      std::string mode = a;
+      for (char& ch : mode) {
+        ch = char(std::tolower(static_cast<unsigned char>(ch)));
+      }
+      cbc_results[slot + " " + set_key + " " + mode + " " + UpperCase(b)] =
+          bytes;
+      ++results;
+    }
+  }
+  XELOGI("XeKeys: {} derived keys and {} results loaded from {}", keys,
+         results, xe::path_to_utf8(path));
+}
+
+// Called with title_keys_mutex held.
+void ReportNeeded(const std::string& line) {
+  if (!reported_needs.insert(line).second) {
+    return;
+  }
+  XELOGW("XeKeys: no result for title key call: {}", line);
+  std::ofstream file(TitleKeyPath("title_keys_needed.txt"), std::ios::app);
+  if (file) {
+    file << "NEED " << line << "\n";
+  }
+}
+
+}  // namespace
+
+dword_result_t XeKeysSetKey_entry(word_t key_num, lpvoid_t key_buffer,
+                                  dword_t key_size) {
+  if (!key_buffer || !key_size || key_size > 0x100) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  const uint8_t* data = key_buffer.as<const uint8_t*>();
+  std::lock_guard<std::mutex> lock(title_keys_mutex);
+  title_keys[uint16_t(key_num)].assign(data, data + uint32_t(key_size));
+  XELOGI("XeKeysSetKey: key 0x{:04X} set ({} bytes): {}", uint16_t(key_num),
+         uint32_t(key_size), ToHex(data, uint32_t(key_size)));
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(XeKeysSetKey, kNone, kImplemented);
+
+dword_result_t XeKeysAesCbc_entry(word_t key_num, lpvoid_t inp_ptr,
+                                  dword_t inp_size, lpvoid_t out_ptr,
+                                  lpvoid_t feed_ptr, dword_t encrypt) {
+  if (!inp_ptr || !out_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  const uint32_t size = uint32_t(inp_size) & ~15u;
+  const uint8_t* inp = inp_ptr.as<const uint8_t*>();
+  uint8_t* out = out_ptr.as<uint8_t*>();
+  // Titles may pass no feed (initialisation vector): use zeros then, and
+  // never touch guest address 0.
+  uint8_t zero_feed[16] = {};
+  uint8_t* feed = feed_ptr ? feed_ptr.as<uint8_t*>() : zero_feed;
+  const uint16_t slot_num = uint16_t(key_num);
+
+  uint8_t key[16];
+  bool found = false;
+  {
+    std::lock_guard<std::mutex> lock(title_keys_mutex);
+    auto it = title_keys.find(slot_num);
+    if (IsTitleKeySlot(slot_num)) {
+      LoadTitleKeyFile();
+      if (it == title_keys.end()) {
+        XELOGW("XeKeysAesCbc: title key 0x{:04X} was never set", slot_num);
+        return X_STATUS_UNSUCCESSFUL;
+      }
+      char slot_text[8];
+      std::snprintf(slot_text, sizeof(slot_text), "%02X", slot_num);
+      const std::string set_key =
+          std::string(slot_text) + " " +
+          ToHex(it->second.data(), it->second.size());
+      auto derived = derived_keys.find(set_key);
+      if (derived != derived_keys.end()) {
+        std::memcpy(key, derived->second.data(), sizeof(key));
+        found = true;
+      } else {
+        const bool zero_iv =
+            std::all_of(feed, feed + 16, [](uint8_t v) { return v == 0; });
+        const std::string call = set_key + " " +
+                                 (encrypt ? "encrypt" : "decrypt") + " " +
+                                 ToHex(inp, size);
+        auto result = cbc_results.find(call);
+        if (zero_iv && result != cbc_results.end() &&
+            result->second.size() == size) {
+          std::memcpy(out, result->second.data(), size);
+          if (size >= 16) {
+            // CBC leaves the last cipher block in the feed.
+            std::memcpy(feed, encrypt ? out + size - 16 : inp + size - 16,
+                        16);
+          }
+          XELOGI("XeKeysAesCbc: title key 0x{:04X} answered from {}",
+                 slot_num, cvars::title_key_file);
+          return X_STATUS_SUCCESS;
+        }
+        ReportNeeded(zero_iv ? call : call + " (non-zero IV " +
+                                          ToHex(feed, 16) + ")");
+        // Carry on with the key as set; the result will be wrong.
+        std::memcpy(key, it->second.data(),
+                    std::min<size_t>(sizeof(key), it->second.size()));
+        found = it->second.size() >= sizeof(key);
+      }
+    } else if (it != title_keys.end() && it->second.size() >= sizeof(key)) {
+      std::memcpy(key, it->second.data(), sizeof(key));
+      found = true;
+    }
+  }
+  if (!found && key_vault.contains(slot_num)) {
+    std::span<const uint8_t> vault_key = key_vault.at(slot_num);
+    if (vault_key.size() >= sizeof(key)) {
+      std::memcpy(key, vault_key.data(), sizeof(key));
+      found = true;
+    }
+  }
+  if (!found) {
+    XELOGW("XeKeysAesCbc: key 0x{:04X} not available", slot_num);
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  XECRYPT_AES_STATE aes;
+  XeCryptAesKey_entry(&aes, key);
+  const uint8_t* keytab = reinterpret_cast<const uint8_t*>(aes.keytabenc);
+  for (uint32_t i = 0; i < size; i += 16) {
+    uint8_t block[16];
+    std::memcpy(block, inp + i, 16);
+    if (encrypt) {
+      for (uint32_t j = 0; j < 16; ++j) {
+        feed[j] ^= block[j];
+      }
+      aes_encrypt_128(keytab, feed, feed);
+      std::memcpy(out + i, feed, 16);
+    } else {
+      uint8_t plain[16];
+      aes_decrypt_128(keytab, block, plain);
+      for (uint32_t j = 0; j < 16; ++j) {
+        out[i + j] = plain[j] ^ feed[j];
+      }
+      std::memcpy(feed, block, 16);
+    }
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(XeKeysAesCbc, kNone, kImplemented);
 
 dword_result_t XeKeysObscureKey_entry(lpvoid_t input, lpvoid_t output) {
   // Based on HvxKeysObscureKey

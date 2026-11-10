@@ -859,6 +859,33 @@ struct ResolveInfo {
   }
 };
 
+// Which rectangle of a copy-mode draw GetResolveInfo reads its extent from.
+// Direct3D 9 resolves by drawing one rectangle (3 vertices of 2 floats in
+// vertex fetch 0), but titles can resolve a whole rectangle list in one draw
+// (the Kinect NUI runtime resolves dozens to hundreds per draw). The command
+// processor selects each rectangle in turn around its per-rectangle resolves;
+// only accessed on the GPU command processor thread.
+struct ResolveRectangle {
+  uint32_t fetch_index = 0;  // Vertex fetch constant holding the vertices.
+  uint32_t first_vertex = 0;
+  uint32_t stride_dwords = 2;
+};
+void SetResolveRectangle(const ResolveRectangle& rectangle);
+const ResolveRectangle& GetResolveRectangle();
+
+// For a copy-mode draw, returns how many rectangles to resolve one by one
+// (at least 1) and their vertex stride in dwords. Validates the layout by
+// requiring every rectangle's 3 corners to be axis-aligned; falls back to the
+// first rectangle with a 2-float stride (the Direct3D 9 layout) otherwise.
+// Direct3D 9 always uses vertex fetch constant 0; other code may use any, so
+// all 96 are searched (0 first). Returns the rectangle count and fills the
+// fetch index and stride of `layout_out` (first_vertex is left at 0).
+uint32_t GetResolveRectangleLayout(const RegisterFile& regs,
+                                   const Memory& memory,
+                                   xenos::PrimitiveType primitive_type,
+                                   uint32_t vertex_count,
+                                   ResolveRectangle& layout_out);
+
 // Returns false if there was an error obtaining the info making it totally
 // invalid. fixed_rg[ba]16_truncated_to_minus_1_to_1 is false if 16_16[_16_16]
 // color render target formats are properly emulated as -32...32, true if

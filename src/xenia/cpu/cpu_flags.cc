@@ -55,5 +55,16 @@ DEFINE_uint64(break_condition_value, 0, "value compared against", "CPU");
 DEFINE_string(break_condition_op, "eq", "comparison operator", "CPU");
 DEFINE_bool(break_condition_truncate, true, "truncate value to 32-bits", "CPU");
 
+DEFINE_string(probe_guest_addresses, "",
+              "Comma-separated guest instruction addresses (hex). Each time one "
+              "executes it is counted, and the first hits plus every 300th are "
+              "logged with r3-r6 and LR. Diagnostic only.",
+              "CPU");
+
+DEFINE_string(probe_dump, "",
+              "ADDRESS:LENGTH (hex). Each logged --probe_guest_addresses hit "
+              "also hex-dumps this much guest memory (at most 0x1000 bytes).",
+              "CPU");
+
 DEFINE_bool(break_on_debugbreak, true, "int3 on JITed __debugbreak requests.",
             "CPU");

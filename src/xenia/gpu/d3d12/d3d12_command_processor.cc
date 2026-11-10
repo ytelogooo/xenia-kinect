@@ -8,7 +8,13 @@
  */
 
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
+#include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 #include "xenia/apu/audio_system.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
@@ -39,12 +45,216 @@ DEFINE_bool(d3d12_submit_on_primary_buffer_end, true,
             "possible to submit immediately to try to reduce frame latency.",
             "D3D12");
 
+DEFINE_bool(
+    d3d12_batch_resolve_rectangles, true,
+    "Resolve all rectangles of a copy-mode rectangle list draw (the Kinect "
+    "NUI runtime resolves thousands of tiny ones per frame) together, with "
+    "the GPU barriers set once instead of around every rectangle. Same "
+    "result, much less GPU stalling; only done where that's guaranteed (host "
+    "render targets, no resolution scaling, no clears).",
+    "GPU");
+
+DEFINE_bool(
+    d3d12_gpu_timing, false,
+    "Measure with GPU timestamps how long the GPU spends on resolves and on "
+    "memexport draws between the waits for memexport results, logged with "
+    "log_gpu_readback_stats (diagnostics).",
+    "GPU");
+
+DEFINE_bool(log_gpu_readback_stats, true,
+            "Log, every 5 seconds while a game reads GPU results back "
+            "(readback_memexport / readback_resolve), how many read-backs it "
+            "did per frame and how long the CPU waited for the GPU on them.",
+            "GPU");
+
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(readback_resolve_half_pixel_offset);
 
 namespace xe {
 namespace gpu {
 namespace d3d12 {
+
+namespace {
+// What GPU read-backs cost (log_gpu_readback_stats); only touched on the
+// command processor thread.
+struct ReadbackStats {
+  using Clock = std::chrono::steady_clock;
+  Clock::time_point period_start = Clock::now();
+  uint32_t frames = 0;
+  uint32_t memexport_draws = 0;
+  uint64_t memexport_bytes = 0;
+  uint32_t resolves = 0;
+  uint64_t resolve_bytes = 0;
+  uint32_t waits = 0;
+  double wait_ms = 0.0;
+  uint32_t frame_waits = 0;
+  uint32_t max_frame_waits = 0;
+  // Where the GPU thread's time goes.
+  uint32_t draws = 0;
+  double draw_ms = 0.0;
+  double copy_ms = 0.0;
+  double swap_ms = 0.0;
+  double memexport_wait_ms = 0.0;
+  // Resolve read-back CPU work: recording the copies, copying to guest memory.
+  double readback_prepare_ms = 0.0;
+  double readback_copy_ms = 0.0;
+  // How many times each resolve destination (address and length) is written.
+  uint32_t all_resolves = 0;
+  // d3d12_gpu_timing: GPU time between memexport waits.
+  enum GpuCategory : uint32_t {
+    kGpuResolveListsBatched,
+    kGpuResolvesOther,
+    kGpuMemexportDraws,
+    kGpuCategoryCount,
+  };
+  double gpu_ms[kGpuCategoryCount] = {};
+  double gpu_window_ms = 0.0;
+  uint32_t gpu_windows = 0;
+  // Rectangle list resolve draws (d3d12_batch_resolve_rectangles).
+  uint32_t batched_lists = 0;
+  uint32_t unbatched_lists = 0;
+  // By D3D12RenderTargetCache::ResolveRectanglesFallback.
+  uint32_t unbatched_reasons[8] = {};
+  std::unordered_map<uint64_t, uint32_t> resolve_targets;
+  static double Ms(Clock::time_point since) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - since)
+        .count();
+  }
+  void Wait(Clock::time_point since) {
+    ++waits;
+    ++frame_waits;
+    wait_ms += Ms(since);
+  }
+  void Resolve(uint32_t address, uint32_t length) {
+    ++all_resolves;
+    if (resolve_targets.size() < 4096 ||
+        resolve_targets.count((uint64_t(address) << 32) | length)) {
+      ++resolve_targets[(uint64_t(address) << 32) | length];
+    }
+  }
+  void EndFrame() {
+    ++frames;
+    max_frame_waits = std::max(max_frame_waits, frame_waits);
+    frame_waits = 0;
+    const Clock::time_point now = Clock::now();
+    const double seconds =
+        std::chrono::duration<double>(now - period_start).count();
+    if (seconds < 5.0) {
+      return;
+    }
+    const double frame_count = double(std::max(frames, 1u));
+    {
+      const double wall_ms = seconds * 1000.0 / frame_count;
+      const double busy_ms = (draw_ms + copy_ms + swap_ms) / frame_count;
+      XELOGI(
+          "GPU thread: {:.1f} frames/s, per frame ({:.1f} ms): {:.0f} draws "
+          "{:.1f} ms, {:.0f} resolves {:.1f} ms, swap {:.1f} ms; of that "
+          "{:.1f} ms waiting for the GPU on memexport and {:.1f} ms on "
+          "resolves; {:.1f} ms idle or waiting for the game",
+          frames / seconds, wall_ms, draws / frame_count, draw_ms / frame_count,
+          all_resolves / frame_count, copy_ms / frame_count,
+          swap_ms / frame_count, memexport_wait_ms / frame_count,
+          (wait_ms - memexport_wait_ms) / frame_count,
+          std::max(wall_ms - busy_ms, 0.0));
+      if (gpu_windows) {
+        XELOGI(
+            "GPU time (timestamps, {} waits for memexport): per frame {:.1f} ms "
+            "of GPU work - batched resolve lists {:.1f} ms, other resolves "
+            "{:.1f} ms, memexport draws {:.1f} ms, everything else {:.1f} ms",
+            gpu_windows, gpu_window_ms / frame_count,
+            gpu_ms[kGpuResolveListsBatched] / frame_count,
+            gpu_ms[kGpuResolvesOther] / frame_count,
+            gpu_ms[kGpuMemexportDraws] / frame_count,
+            std::max(gpu_window_ms - gpu_ms[kGpuResolveListsBatched] -
+                         gpu_ms[kGpuResolvesOther] - gpu_ms[kGpuMemexportDraws],
+                     0.0) /
+                frame_count);
+      }
+      if (batched_lists || unbatched_lists) {
+        XELOGI(
+            "GPU thread: per frame {:.1f} resolve rectangle lists batched, "
+            "{:.1f} resolved one rectangle at a time (not applicable {}, info "
+            "{}, clearing another region {}, dump layouts {}, shader {}, "
+            "overlap with clears {})",
+            batched_lists / frame_count, unbatched_lists / frame_count,
+            unbatched_reasons[1], unbatched_reasons[2], unbatched_reasons[3],
+            unbatched_reasons[4], unbatched_reasons[5], unbatched_reasons[6]);
+      }
+      if (all_resolves) {
+        std::vector<std::pair<uint32_t, uint64_t>> top;
+        top.reserve(resolve_targets.size());
+        for (const auto& target : resolve_targets) {
+          top.emplace_back(target.second, target.first);
+        }
+        size_t shown = std::min<size_t>(top.size(), 6);
+        std::partial_sort(top.begin(), top.begin() + shown, top.end(),
+                          [](const auto& a, const auto& b) {
+                            return a.first > b.first;
+                          });
+        std::string list;
+        for (size_t i = 0; i < shown; ++i) {
+          list += fmt::format(" {:08X}+{}x{:.1f}", uint32_t(top[i].second >> 32),
+                              uint32_t(top[i].second),
+                              top[i].first / frame_count);
+        }
+        XELOGI(
+            "GPU thread: {} resolve destinations; most written (address+bytes "
+            "x per frame):{}",
+            resolve_targets.size(), list);
+      }
+    }
+    if (resolves) {
+      XELOGI(
+          "GPU read-back: per frame resolve read-backs took {:.1f} ms to "
+          "record and {:.1f} ms to copy to guest memory",
+          readback_prepare_ms / std::max(frames, 1u),
+          readback_copy_ms / std::max(frames, 1u));
+    }
+    if (memexport_draws || resolves) {
+      XELOGI(
+          "GPU read-back: {:.1f} frames/s; per frame {:.1f} memexport draws "
+          "({:.0f} KB), {:.1f} resolves ({:.0f} KB), {:.1f} GPU waits (at most "
+          "{}) taking {:.1f} ms",
+          frames / seconds, double(memexport_draws) / std::max(frames, 1u),
+          memexport_bytes / 1024.0 / std::max(frames, 1u),
+          double(resolves) / std::max(frames, 1u),
+          resolve_bytes / 1024.0 / std::max(frames, 1u),
+          double(waits) / std::max(frames, 1u), max_frame_waits,
+          wait_ms / std::max(frames, 1u));
+    }
+    *this = ReadbackStats();
+    period_start = now;
+  }
+};
+constexpr uint32_t kResolveFallbackReasons = 8;
+ReadbackStats readback_stats_;
+// Adds the time until the end of the scope to a ReadbackStats counter.
+struct ReadbackStatsTimer {
+  explicit ReadbackStatsTimer(double& counter)
+      : counter_(counter), start_(ReadbackStats::Clock::now()) {}
+  ~ReadbackStatsTimer() { counter_ += ReadbackStats::Ms(start_); }
+  double& counter_;
+  ReadbackStats::Clock::time_point start_;
+};
+// d3d12_gpu_timing - timestamps since the last wait for memexport results.
+struct GpuTiming {
+  static constexpr uint32_t kCapacity = 8192;
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> heap;
+  Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+  ID3D12Device* device = nullptr;
+  bool failed = false;
+  uint64_t frequency = 0;
+  uint32_t count = 0;
+  bool overflow = false;
+  struct Span {
+    uint32_t category;
+    uint32_t begin;
+    uint32_t end;
+  };
+  std::vector<Span> spans;
+};
+GpuTiming gpu_timing_;
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -1688,8 +1898,8 @@ void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
 
   for (auto& pair : readback_buffers_) {
-    ui::d3d12::util::ReleaseAndNull(pair.second.buffers[0]);
-    ui::d3d12::util::ReleaseAndNull(pair.second.buffers[1]);
+    pair.second.Release(0);
+    pair.second.Release(1);
   }
   readback_buffers_.clear();
 
@@ -2252,6 +2462,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
   EndZPDFrame();
+  if (cvars::log_gpu_readback_stats) {
+    readback_stats_.EndFrame();
+  }
+  ReadbackStatsTimer swap_timer(readback_stats_.swap_ms);
 
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
@@ -2624,7 +2838,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   const RegisterFile& regs = *register_file_;
 
@@ -2639,7 +2852,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       OnVIZSurveyDraw(false);
       return true;
     }
-    return IssueCopy();
+    return IssueCopyRectanglesBatched(primitive_type, index_count);
+  }
+  // Resolves (above) are timed separately.
+  ++readback_stats_.draws;
+  ReadbackStatsTimer draw_timer(readback_stats_.draw_ms);
+  if (!gpu_timing_.count && cvars::d3d12_gpu_timing && submission_open_) {
+    // The start of the GPU timing window.
+    GpuTimestamp();
   }
 
   if (regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0) {
@@ -3041,6 +3261,38 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       return false;
     }
   }
+  // Snapshot the export ranges before the draw so the readback after it only
+  // copies the bytes the shaders actually changed. Copying the whole range
+  // back would overwrite anything the CPU wrote there while the draw was in
+  // flight, since the ranges are usually much larger than what gets exported.
+  // The first half of the readback buffer holds the snapshot, the second half
+  // the result.
+  uint32_t memexport_total_size = 0;
+  bool memexport_snapshot_taken = false;
+  if (memexport_used && GetGPUSetting(GPUSetting::ReadbackMemexport)) {
+    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+      memexport_total_size += memexport_range.size_bytes;
+    }
+    if (memexport_total_size != 0) {
+      ID3D12Resource* readback_buffer =
+          RequestReadbackBuffer(memexport_total_size * 2);
+      if (readback_buffer != nullptr) {
+        shared_memory_->UseAsCopySource();
+        SubmitBarriers();
+        ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
+        uint32_t readback_buffer_offset = 0;
+        for (const draw_util::MemExportRange& memexport_range :
+             memexport_ranges_) {
+          deferred_command_list_.D3DCopyBufferRegion(
+              readback_buffer, readback_buffer_offset, shared_memory_buffer,
+              memexport_range.base_address_dwords << 2,
+              memexport_range.size_bytes);
+          readback_buffer_offset += memexport_range.size_bytes;
+        }
+        memexport_snapshot_taken = true;
+      }
+    }
+  }
   // Primitive topology.
   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
   if (primitive_processing_result.IsTessellated()) {
@@ -3122,6 +3374,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
 
   // Draw.
+  const uint32_t gpu_timing_draw_begin =
+      memexport_used ? GpuTimestamp() : UINT32_MAX;
   OnVIZSurveyDraw(true);
   if (primitive_processing_result.index_buffer_type ==
       PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
@@ -3221,6 +3475,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     }
   }
 
+  GpuTimingSpan(ReadbackStats::kGpuMemexportDraws, gpu_timing_draw_begin);
+
   if (memexport_used) {
     // Make sure this memexporting draw is ordered with other work using shared
     // memory as a UAV.
@@ -3232,48 +3488,57 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       shared_memory_->RangeWrittenByGpu(
           memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
     }
-    if (GetGPUSetting(GPUSetting::ReadbackMemexport)) {
+    if (memexport_snapshot_taken) {
       // Read the exported data on the CPU.
-      uint32_t memexport_total_size = 0;
-      for (const draw_util::MemExportRange& memexport_range :
-           memexport_ranges_) {
-        memexport_total_size += memexport_range.size_bytes;
-      }
-      if (memexport_total_size != 0) {
-        ID3D12Resource* readback_buffer =
-            RequestReadbackBuffer(memexport_total_size);
-        if (readback_buffer != nullptr) {
-          shared_memory_->UseAsCopySource();
-          SubmitBarriers();
-          ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
-          uint32_t readback_buffer_offset = 0;
-          for (const draw_util::MemExportRange& memexport_range :
-               memexport_ranges_) {
-            uint32_t memexport_range_size = memexport_range.size_bytes;
-            deferred_command_list_.D3DCopyBufferRegion(
-                readback_buffer, readback_buffer_offset, shared_memory_buffer,
-                memexport_range.base_address_dwords << 2, memexport_range_size);
-            readback_buffer_offset += memexport_range_size;
-          }
-          if (AwaitAllQueueOperationsCompletion()) {
-            D3D12_RANGE readback_range;
-            readback_range.Begin = 0;
-            readback_range.End = memexport_total_size;
-            void* readback_mapping;
-            if (SUCCEEDED(readback_buffer->Map(0, &readback_range,
-                                               &readback_mapping))) {
-              const uint8_t* readback_bytes =
-                  reinterpret_cast<const uint8_t*>(readback_mapping);
-              for (const draw_util::MemExportRange& memexport_range :
-                   memexport_ranges_) {
-                std::memcpy(memory_->TranslatePhysical(
-                                memexport_range.base_address_dwords << 2),
-                            readback_bytes, memexport_range.size_bytes);
-                readback_bytes += memexport_range.size_bytes;
+      ID3D12Resource* readback_buffer =
+          RequestReadbackBuffer(memexport_total_size * 2);
+      if (readback_buffer != nullptr) {
+        shared_memory_->UseAsCopySource();
+        SubmitBarriers();
+        ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
+        uint32_t readback_buffer_offset = memexport_total_size;
+        for (const draw_util::MemExportRange& memexport_range :
+             memexport_ranges_) {
+          uint32_t memexport_range_size = memexport_range.size_bytes;
+          deferred_command_list_.D3DCopyBufferRegion(
+              readback_buffer, readback_buffer_offset, shared_memory_buffer,
+              memexport_range.base_address_dwords << 2, memexport_range_size);
+          readback_buffer_offset += memexport_range_size;
+        }
+        ++readback_stats_.memexport_draws;
+        readback_stats_.memexport_bytes += memexport_total_size;
+        GpuTimingBeforeWait();
+        const auto wait_start = ReadbackStats::Clock::now();
+        const bool awaited = AwaitAllQueueOperationsCompletion();
+        readback_stats_.Wait(wait_start);
+        readback_stats_.memexport_wait_ms += ReadbackStats::Ms(wait_start);
+        GpuTimingAfterWait(awaited);
+        if (awaited) {
+          D3D12_RANGE readback_range;
+          readback_range.Begin = 0;
+          readback_range.End = memexport_total_size * 2;
+          void* readback_mapping;
+          if (SUCCEEDED(readback_buffer->Map(0, &readback_range,
+                                             &readback_mapping))) {
+            // Compared per byte as exports of 8 and 16 bit formats give
+            // ranges that aren't a multiple of 4 bytes.
+            const uint8_t* before_bytes =
+                reinterpret_cast<const uint8_t*>(readback_mapping);
+            const uint8_t* after_bytes = before_bytes + memexport_total_size;
+            for (const draw_util::MemExportRange& memexport_range :
+                 memexport_ranges_) {
+              uint8_t* guest_bytes = memory_->TranslatePhysical(
+                  memexport_range.base_address_dwords << 2);
+              for (uint32_t i = 0; i < memexport_range.size_bytes; ++i) {
+                if (after_bytes[i] != before_bytes[i]) {
+                  guest_bytes[i] = after_bytes[i];
+                }
               }
-              D3D12_RANGE readback_write_range = {};
-              readback_buffer->Unmap(0, &readback_write_range);
+              before_bytes += memexport_range.size_bytes;
+              after_bytes += memexport_range.size_bytes;
             }
+            D3D12_RANGE readback_write_range = {};
+            readback_buffer->Unmap(0, &readback_write_range);
           }
         }
       }
@@ -3305,22 +3570,188 @@ void D3D12CommandProcessor::InitializeTrace() {
   }
 }
 
+uint32_t D3D12CommandProcessor::GpuTimestamp() {
+  if (!cvars::d3d12_gpu_timing || !submission_open_) {
+    return UINT32_MAX;
+  }
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  if (gpu_timing_.device != device) {
+    gpu_timing_ = GpuTiming();
+    gpu_timing_.device = device;
+    D3D12_QUERY_HEAP_DESC heap_desc = {};
+    heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    heap_desc.Count = GpuTiming::kCapacity;
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(
+        buffer_desc, GpuTiming::kCapacity * sizeof(uint64_t),
+        D3D12_RESOURCE_FLAG_NONE);
+    if (FAILED(device->CreateQueryHeap(&heap_desc,
+                                       IID_PPV_ARGS(&gpu_timing_.heap))) ||
+        FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback,
+            provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&gpu_timing_.readback))) ||
+        FAILED(provider.GetDirectQueue()->GetTimestampFrequency(
+            &gpu_timing_.frequency)) ||
+        !gpu_timing_.frequency) {
+      XELOGE("d3d12_gpu_timing: failed to set up the timestamp queries");
+      gpu_timing_.failed = true;
+    }
+  }
+  if (gpu_timing_.failed) {
+    return UINT32_MAX;
+  }
+  if (gpu_timing_.count >= GpuTiming::kCapacity) {
+    gpu_timing_.overflow = true;
+    return UINT32_MAX;
+  }
+  deferred_command_list_.D3DEndQuery(gpu_timing_.heap.Get(),
+                                     D3D12_QUERY_TYPE_TIMESTAMP,
+                                     gpu_timing_.count);
+  return gpu_timing_.count++;
+}
+
+void D3D12CommandProcessor::GpuTimingSpan(uint32_t category, uint32_t begin) {
+  if (begin == UINT32_MAX) {
+    return;
+  }
+  uint32_t end = GpuTimestamp();
+  if (end != UINT32_MAX) {
+    gpu_timing_.spans.push_back({category, begin, end});
+  }
+}
+
+void D3D12CommandProcessor::GpuTimingBeforeWait() {
+  if (!gpu_timing_.count || gpu_timing_.failed || !submission_open_) {
+    return;
+  }
+  // The end of the window.
+  GpuTimestamp();
+  deferred_command_list_.D3DResolveQueryData(
+      gpu_timing_.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, gpu_timing_.count,
+      gpu_timing_.readback.Get(), 0);
+}
+
+void D3D12CommandProcessor::GpuTimingAfterWait(bool awaited) {
+  if (!gpu_timing_.count) {
+    return;
+  }
+  if (awaited && !gpu_timing_.overflow && gpu_timing_.count >= 2) {
+    D3D12_RANGE read_range;
+    read_range.Begin = 0;
+    read_range.End = gpu_timing_.count * sizeof(uint64_t);
+    void* mapping;
+    if (SUCCEEDED(gpu_timing_.readback->Map(0, &read_range, &mapping))) {
+      const uint64_t* ticks = reinterpret_cast<const uint64_t*>(mapping);
+      const double ms_per_tick = 1000.0 / double(gpu_timing_.frequency);
+      auto span_ms = [&](uint32_t begin, uint32_t end) {
+        return ticks[end] > ticks[begin]
+                   ? double(ticks[end] - ticks[begin]) * ms_per_tick
+                   : 0.0;
+      };
+      readback_stats_.gpu_window_ms += span_ms(0, gpu_timing_.count - 1);
+      ++readback_stats_.gpu_windows;
+      for (const GpuTiming::Span& span : gpu_timing_.spans) {
+        readback_stats_.gpu_ms[span.category] += span_ms(span.begin, span.end);
+      }
+      D3D12_RANGE write_range = {};
+      gpu_timing_.readback->Unmap(0, &write_range);
+    }
+  }
+  gpu_timing_.count = 0;
+  gpu_timing_.overflow = false;
+  gpu_timing_.spans.clear();
+}
+
+bool D3D12CommandProcessor::IssueCopyRectanglesBatched(
+    xenos::PrimitiveType primitive_type, uint32_t vertex_count) {
+  if (!cvars::d3d12_batch_resolve_rectangles) {
+    return IssueCopyRectangles(primitive_type, vertex_count);
+  }
+  draw_util::ResolveRectangle layout;
+  uint32_t rectangle_count = draw_util::GetResolveRectangleLayout(
+      *register_file_, *memory_, primitive_type, vertex_count, layout);
+  if (rectangle_count < 2) {
+    return IssueCopyRectangles(primitive_type, vertex_count);
+  }
+  bool handled;
+  {
+    ReadbackStatsTimer copy_timer(readback_stats_.copy_ms);
+    if (!BeginSubmission(true)) {
+      return false;
+    }
+    const uint32_t gpu_timing_begin = GpuTimestamp();
+    D3D12RenderTargetCache::ResolveRectanglesFallback fallback;
+    handled = render_target_cache_->ResolveRectangles(
+        *memory_, *shared_memory_, *texture_cache_, layout, rectangle_count,
+        batched_resolve_ranges_, fallback);
+    if (!handled && uint32_t(fallback) < kResolveFallbackReasons) {
+      ++readback_stats_.unbatched_reasons[uint32_t(fallback)];
+    }
+    draw_util::SetResolveRectangle({});
+    if (handled) {
+      ++readback_stats_.batched_lists;
+      for (const auto& range : batched_resolve_ranges_) {
+        readback_stats_.Resolve(range.first, range.second);
+      }
+      if (GetReadbackResolveMode() != ReadbackResolveMode::kDisabled) {
+        // Native (unscaled) resolves only - the copy destination info is only
+        // needed for downscaling.
+        reg::RB_COPY_DEST_INFO copy_dest_info;
+        copy_dest_info.value = 0;
+        batched_readbacks_.clear();
+        const auto prepare_start = ReadbackStats::Clock::now();
+        for (const auto& range : batched_resolve_ranges_) {
+          PendingResolveReadback pending;
+          if (PrepareResolveReadback(range.first, range.second,
+                                     copy_dest_info, false, pending)) {
+            batched_readbacks_.push_back(pending);
+          }
+        }
+        readback_stats_.readback_prepare_ms +=
+            ReadbackStats::Ms(prepare_start);
+        FinishResolveReadbacks(batched_readbacks_.data(),
+                               batched_readbacks_.size());
+      }
+    }
+    GpuTimingSpan(handled ? ReadbackStats::kGpuResolveListsBatched
+                          : ReadbackStats::kGpuResolvesOther,
+                  gpu_timing_begin);
+  }
+  if (!handled) {
+    // Can't be batched - one by one.
+    ++readback_stats_.unbatched_lists;
+    return IssueCopyRectangles(primitive_type, vertex_count);
+  }
+  return true;
+}
+
 bool D3D12CommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  ReadbackStatsTimer copy_timer(readback_stats_.copy_ms);
   if (!BeginSubmission(true)) {
     return false;
   }
+  const uint32_t gpu_timing_begin = GpuTimestamp();
+  bool result;
   ReadbackResolveMode readback_mode = GetReadbackResolveMode();
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_,
-                                         *texture_cache_, written_address,
-                                         written_length);
+    result = render_target_cache_->Resolve(*memory_, *shared_memory_,
+                                           *texture_cache_, written_address,
+                                           written_length);
+    if (result && written_length) {
+      readback_stats_.Resolve(written_address, written_length);
+    }
   } else {
-    return IssueCopy_ReadbackResolvePath();
+    result = IssueCopy_ReadbackResolvePath();
   }
+  GpuTimingSpan(ReadbackStats::kGpuResolvesOther, gpu_timing_begin);
+  return result;
 }
 XE_NOINLINE
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
@@ -3335,7 +3766,29 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   if (!written_length) {
     return true;
   }
+  readback_stats_.Resolve(written_address, written_length);
+  return ReadbackResolvedRange(written_address, written_length, copy_dest_info,
+                               is_scaled);
+}
 
+bool D3D12CommandProcessor::ReadbackResolvedRange(
+    uint32_t written_address, uint32_t written_length,
+    const reg::RB_COPY_DEST_INFO& copy_dest_info, bool is_scaled) {
+  PendingResolveReadback pending;
+  const auto prepare_start = ReadbackStats::Clock::now();
+  bool prepared = PrepareResolveReadback(written_address, written_length,
+                                         copy_dest_info, is_scaled, pending);
+  readback_stats_.readback_prepare_ms += ReadbackStats::Ms(prepare_start);
+  if (prepared) {
+    FinishResolveReadbacks(&pending, 1);
+  }
+  return true;
+}
+
+bool D3D12CommandProcessor::PrepareResolveReadback(
+    uint32_t written_address, uint32_t written_length,
+    const reg::RB_COPY_DEST_INFO& copy_dest_info, bool is_scaled,
+    PendingResolveReadback& pending_out) {
   // Skip all the GPU readback work if the destination memory isn't writable.
   VirtualHeap* physical_heap = memory_->GetPhysicalHeap();
   bool memory_accessible = false;
@@ -3352,7 +3805,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
   }
   if (!memory_accessible) {
-    return true;
+    return false;
   }
 
   // With resolution scaling, the resolve went to the scaled resolve buffer,
@@ -3376,7 +3829,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       XELOGGPU(
           "Skipping readback of a resolution-scaled resolve to a 128bpp "
           "destination - not supported by the downscale shader");
-      return true;
+      return false;
     }
     // The scaled addressing is periodic per guest group - the written extent
     // must be group-aligned for the reversal to be valid (tiled destinations
@@ -3387,12 +3840,12 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
           "Skipping readback of a resolution-scaled resolve to 0x{:08X} - the "
           "destination is not aligned to the scaled addressing group size",
           written_address);
-      return true;
+      return false;
     }
     uint32_t tile_bytes = (32 * 32) << downscale_pixel_size_log2;
     downscale_tile_count = written_length / tile_bytes;
     if (!downscale_tile_count) {
-      return true;
+      return false;
     }
     if (written_length % tile_bytes) {
       // Only whole 32x32-texel tiles are downscaled - don't copy a garbage
@@ -3420,12 +3873,12 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
           "Skipping readback of a resolution-scaled resolve to 0x{:08X} - the "
           "written extent is not within the current scaled resolve range",
           written_address);
-      return true;
+      return false;
     }
     downscale_source_buffer =
         texture_cache_->GetCurrentScaledResolveBufferResource();
     if (!downscale_source_buffer) {
-      return true;
+      return false;
     }
     downscale_source_offset =
         scaled_start -
@@ -3452,14 +3905,22 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
             &ui::d3d12::util::kHeapPropertiesReadback,
             provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
             D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
-      if (rb.buffers[write_index] != nullptr) {
-        rb.buffers[write_index]->Release();
-      }
+      rb.Release(write_index);
       rb.buffers[write_index] = buffer;
       rb.sizes[write_index] = size;
+      // Kept mapped for its whole life (allowed for readback heaps; the data
+      // is only read after the copies to it have been awaited) - mapping and
+      // unmapping thousands of tiny buffers every frame costs.
+      D3D12_RANGE read_range;
+      read_range.Begin = 0;
+      read_range.End = size;
+      void* mapping;
+      if (SUCCEEDED(buffer->Map(0, &read_range, &mapping))) {
+        rb.mappings[write_index] = mapping;
+      }
     } else {
       XELOGE("Failed to create a {} MB readback buffer", size >> 20);
-      return true;
+      return false;
     }
   }
 
@@ -3496,14 +3957,14 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
         resolve_downscale_buffer_size_ = size;
       } else {
         XELOGE("Failed to create a {} MB resolve downscale buffer", size >> 20);
-        return true;
+        return false;
       }
     }
 
     ui::d3d12::util::DescriptorCpuGpuHandlePair downscale_descriptors[2];
     if (!RequestOneUseSingleViewDescriptors(2, downscale_descriptors)) {
       XELOGE("Failed to allocate descriptors for the resolve downscale");
-      return true;
+      return false;
     }
 
     const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
@@ -3582,36 +4043,70 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
         readback_length);
   }
 
-  if (readback_mode != ReadbackResolveMode::kFast) {
-    // Wait for GPU to finish (accurate but slow)
-    if (!AwaitAllQueueOperationsCompletion()) {
-      return true;
-    }
-  } else if (read_cache_miss) {
-    // Delayed sync, but the previous buffer doesn't exist - use the current
-    // buffer with a sync as a fallback.
+  ++readback_stats_.resolves;
+  readback_stats_.resolve_bytes += readback_length;
+  // Whether the copy just recorded has to be awaited: always if not delayed,
+  // and in the delayed mode if the previous buffer doesn't exist - the current
+  // buffer is used with a sync as a fallback then.
+  pending_out.wait = readback_mode != ReadbackResolveMode::kFast;
+  if (read_cache_miss) {
     read_index = write_index;
-    if (!AwaitAllQueueOperationsCompletion()) {
-      return true;
+    pending_out.wait = true;
+  }
+  pending_out.source = readback_length <= rb.sizes[read_index]
+                           ? rb.buffers[read_index]
+                           : nullptr;
+  pending_out.mapping = pending_out.source ? rb.mappings[read_index] : nullptr;
+  pending_out.address = written_address;
+  pending_out.length = readback_length;
+  return pending_out.source != nullptr || pending_out.wait;
+}
+
+void D3D12CommandProcessor::FinishResolveReadbacks(
+    const PendingResolveReadback* pending, size_t count) {
+  // One wait for all the copies that need it, rather than one per copy - a
+  // rectangle list with destinations new to the delayed mode would otherwise
+  // sync with the GPU for every rectangle.
+  bool wait = false;
+  for (size_t i = 0; i < count; ++i) {
+    wait |= pending[i].wait;
+  }
+  if (wait) {
+    const auto wait_start = ReadbackStats::Clock::now();
+    const bool awaited = AwaitAllQueueOperationsCompletion();
+    readback_stats_.Wait(wait_start);
+    if (!awaited) {
+      return;
     }
   }
-
-  ID3D12Resource* read_source = rb.buffers[read_index];
-  if (read_source != nullptr && readback_length <= rb.sizes[read_index]) {
+  const auto copy_start = ReadbackStats::Clock::now();
+  for (size_t i = 0; i < count; ++i) {
+    ID3D12Resource* read_source = pending[i].source;
+    if (read_source == nullptr) {
+      continue;
+    }
+    uint32_t readback_length = pending[i].length;
+    if (pending[i].mapping) {
+      memory::vastcpy(
+          memory_->TranslatePhysical(pending[i].address),
+          static_cast<uint8_t*>(const_cast<void*>(pending[i].mapping)),
+          readback_length);
+      continue;
+    }
     D3D12_RANGE readback_range;
     readback_range.Begin = 0;
     readback_range.End = readback_length;
     void* readback_mapping;
     if (SUCCEEDED(read_source->Map(0, &readback_range, &readback_mapping))) {
-      // Memory accessibility already checked at the start of this function
+      // Memory accessibility already checked in PrepareResolveReadback.
       // chrispy: this memcpy needs to be optimized as much as possible
-      auto physaddr = memory_->TranslatePhysical(written_address);
+      auto physaddr = memory_->TranslatePhysical(pending[i].address);
       memory::vastcpy(physaddr, (uint8_t*)readback_mapping, readback_length);
       D3D12_RANGE readback_write_range = {};
       read_source->Unmap(0, &readback_write_range);
     }
   }
-  return true;
+  readback_stats_.readback_copy_ms += ReadbackStats::Ms(copy_start);
 }
 
 void D3D12CommandProcessor::CheckSubmissionCompletion(
@@ -3805,12 +4300,8 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
             it->second.last_used_frame <
                 frame_current_ - kReadbackBufferEvictionAgeFrames) {
           // Release both buffers
-          if (it->second.buffers[0] != nullptr) {
-            it->second.buffers[0]->Release();
-          }
-          if (it->second.buffers[1] != nullptr) {
-            it->second.buffers[1]->Release();
-          }
+          it->second.Release(0);
+          it->second.Release(1);
           it = readback_buffers_.erase(it);
         } else {
           ++it;

@@ -9,6 +9,8 @@
 
 #include "xenia/app/emulator_window.h"
 
+#include <chrono>
+
 #include "third_party/imgui/imgui.h"
 #include "third_party/stb/stb_image_write.h"
 #if defined(__clang__)
@@ -36,6 +38,7 @@
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_video.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_state.h"
@@ -63,6 +66,11 @@ DECLARE_bool(clear_memory_page_state);
 DECLARE_string(readback_resolve);
 
 DECLARE_bool(readback_memexport);
+
+DEFINE_bool(show_fps, false,
+            "Show the title's frame rate (frames presented per second) in the "
+            "window title, and log it every 10 seconds.",
+            "Display");
 
 DEFINE_bool(fullscreen, false, "Whether to launch the emulator in fullscreen.",
             "Display");
@@ -211,6 +219,7 @@ std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
 }
 
 EmulatorWindow::~EmulatorWindow() {
+  StopFpsCounter();
   // Notify the ImGui drawer that the immediate drawer is being destroyed.
   ShutdownGraphicsSystemPresenterPainting();
 }
@@ -267,6 +276,9 @@ void EmulatorWindow::OnEmulatorInitialized() {
 
   emulator_initialized_ = true;
   window_->SetMainMenuEnabled(true);
+  if (cvars::show_fps) {
+    StartFpsCounter();
+  }
   // When the user can see that the emulator isn't initializing anymore (the
   // menu isn't disabled), enter fullscreen if requested.
   if (cvars::fullscreen) {
@@ -1767,6 +1779,46 @@ void EmulatorWindow::ShowBuildCommit() {
 #endif
 }
 
+void EmulatorWindow::StartFpsCounter() {
+  if (fps_thread_running_.exchange(true)) {
+    return;
+  }
+  fps_thread_ = std::thread([this]() {
+    xe::threading::set_name("FPS Counter");
+    uint64_t last_count = kernel::xboxkrnl::GetVdSwapCount();
+    auto last_time = std::chrono::steady_clock::now();
+    uint32_t seconds = 0;
+    while (fps_thread_running_) {
+      // Short sleeps so that shutting down doesn't wait for a whole second.
+      for (int i = 0; i < 10 && fps_thread_running_; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+      const uint64_t count = kernel::xboxkrnl::GetVdSwapCount();
+      const auto now = std::chrono::steady_clock::now();
+      const double elapsed =
+          std::chrono::duration<double>(now - last_time).count();
+      if (elapsed <= 0.0) {
+        continue;
+      }
+      const double fps = double(count - last_count) / elapsed;
+      last_count = count;
+      last_time = now;
+      fps_ = fps;
+      if (++seconds % 10 == 0 && emulator()->is_title_open()) {
+        XELOGI("FPS: {:.1f}", fps);
+      }
+      app_context_.CallInUIThread([this]() { UpdateTitle(); });
+    }
+  });
+}
+
+void EmulatorWindow::StopFpsCounter() {
+  fps_thread_running_ = false;
+  if (fps_thread_.joinable()) {
+    fps_thread_.join();
+  }
+}
+
 void EmulatorWindow::UpdateTitle() {
   xe::StringBuffer sb;
   sb.Append(base_title_);
@@ -1797,6 +1849,10 @@ void EmulatorWindow::UpdateTitle() {
       sb.Append(graphics_name);
       sb.Append(">");
     }
+  }
+
+  if (cvars::show_fps && emulator()->is_title_open() && fps_ >= 0.0) {
+    sb.AppendFormat(" | {:.0f} FPS", fps_.load());
   }
 
   if (Clock::guest_time_scalar() != 1.0) {

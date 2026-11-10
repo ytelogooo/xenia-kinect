@@ -24,6 +24,14 @@
 #include "xenia/vfs/devices/host_path_device.h"
 
 DECLARE_int32(license_mask);
+DECLARE_bool(trace_game_io);
+
+DEFINE_bool(keep_dlc_files_open_on_close, true,
+            "When a title closes a DLC package but still has files open in it, "
+            "keep the package alive until those files are closed instead of "
+            "force-closing them. Just Dance 2015 mounts at most 8 DLC packages "
+            "at a time and keeps reading the files it opened in the others.",
+            "Kernel");
 
 namespace xe {
 namespace kernel {
@@ -456,6 +464,13 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
                                      const uint32_t disc_number) {
   auto global_lock = global_critical_region_.Acquire();
 
+  if (cvars::trace_game_io) {
+    XELOGI("ContentManager::OpenContent: root='{}' file='{}' device={}",
+           root_name, data.file_name(), uint32_t(data.device_id));
+  }
+
+  ReleaseUnusedDetachedPackages();
+
   if (IsContentOpen(root_name)) {
     // Already content open with this root name.
     return X_ERROR_ALREADY_EXISTS;
@@ -496,6 +511,12 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
 X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
   auto global_lock = global_critical_region_.Acquire();
 
+  if (cvars::trace_game_io) {
+    XELOGI("ContentManager::CloseContent: root='{}'", root_name);
+  }
+
+  ReleaseUnusedDetachedPackages();
+
   // 415607D6 - Uses XamContentCreate with name "save", but XamContentClose with
   // "SAVE".
   auto itr = std::ranges::find_if(
@@ -509,6 +530,24 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
   if (itr == mounted_packages_.cend()) {
     return X_ERROR_FILE_NOT_FOUND;
   }
+
+  if (cvars::keep_dlc_files_open_on_close &&
+      itr->second->GetContentMetadata().content_type ==
+          XContentType::kMarketplaceContent &&
+      HasOpenFilesInPackage(*itr->second)) {
+    // The title closed the package but still uses files it opened in it. On a
+    // console those files stay valid, so keep the device alive and free the
+    // root name; the package goes away once the last file is closed.
+    XELOGI(
+        "ContentManager: keeping DLC package {} alive for files that are "
+        "still open (content '{}' closed)",
+        itr->second->GetDevicePath(), root_name);
+    itr->second->DetachRootName();
+    auto node = mounted_packages_.extract(itr);
+    detached_packages_.push_back(std::move(node.mapped()));
+    return X_ERROR_SUCCESS;
+  }
+
   CloseOpenedFilesFromContent(root_name);
 
   mounted_packages_.erase(itr);
@@ -607,6 +646,33 @@ bool ContentManager::IsContentOpen(const std::string_view root_name) const {
   });
 }
 
+bool ContentManager::HasOpenFilesInPackage(
+    const ContentPackage& package) const {
+  const std::string_view device_path = package.GetDevicePath();
+  const std::vector<object_ref<XFile>> all_files_handles =
+      kernel_state_->object_table()->GetObjectsByType<XFile>(
+          XObject::Type::File);
+  for (const object_ref<XFile>& file : all_files_handles) {
+    if (!file->entry()) {
+      continue;
+    }
+    if (utf8::starts_with(file->entry()->absolute_path(), device_path)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void ContentManager::ReleaseUnusedDetachedPackages() {
+  if (detached_packages_.empty()) {
+    return;
+  }
+  std::erase_if(detached_packages_,
+                [this](const std::unique_ptr<ContentPackage>& package) {
+                  return !HasOpenFilesInPackage(*package);
+                });
+}
+
 void ContentManager::CloseOpenedFilesFromContent(
     const std::string_view root_name) {
   // TODO(Gliniak): Cleanup this code to care only about handles
@@ -627,6 +693,12 @@ void ContentManager::CloseOpenedFilesFromContent(
     bool is_file_inside_content = utf8::starts_with(file_path, resolved_path);
 
     if (is_file_inside_content) {
+      if (cvars::trace_game_io) {
+        XELOGI(
+            "ContentManager: releasing file handle {:08X} '{}' (content '{}' "
+            "closed)",
+            file->handle(), file_path, root_name);
+      }
       file->ReleaseHandle();
     }
   }

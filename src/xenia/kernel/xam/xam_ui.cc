@@ -16,6 +16,7 @@
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_private.h"
+#include "xenia/kernel/xboxkrnl/kinect_tuner.h"
 #include "xenia/ui/file_picker.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
@@ -836,6 +837,22 @@ dword_result_t XamShowMarketplaceUI_entry(dword_t user_index, dword_t ui_type,
 }
 DECLARE_XAM_EXPORT1(XamShowMarketplaceUI, kUI, kSketchy);
 
+// XamShowMarketplaceUI with the tracking ID of a Kinect skeleton first.
+dword_result_t XamShowNuiMarketplaceUI_entry(dword_t tracking_id,
+                                             dword_t user_index,
+                                             dword_t ui_type, qword_t offer_id,
+                                             dword_t offer_type,
+                                             dword_t content_category,
+                                             dword_t title_id) {
+  auto result = kernel_state()->nui()->NuiHudCheck(tracking_id);
+  if (result) {
+    return result;
+  }
+  return XamShowMarketplaceUI_entry(user_index, ui_type, offer_id, offer_type,
+                                    content_category, title_id);
+}
+DECLARE_XAM_EXPORT1(XamShowNuiMarketplaceUI, kUI, kSketchy);
+
 dword_result_t XamShowMarketplaceDownloadItemsUI_entry(
     dword_t user_index, dword_t ui_type, lpqword_t offers, dword_t num_offers,
     lpdword_t hresult_ptr, pointer_t<XAM_OVERLAPPED> overlapped) {
@@ -1136,6 +1153,53 @@ dword_result_t XamShowAchievementsUI_entry(dword_t user_index,
 }
 DECLARE_XAM_EXPORT1(XamShowAchievementsUI, kUserProfiles, kStub);
 
+// XamShowAchievementsUI with the tracking ID of a Kinect skeleton first.
+dword_result_t XamShowNuiAchievementsUI_entry(dword_t tracking_id,
+                                              dword_t user_index,
+                                              dword_t title_id) {
+  auto result = kernel_state()->nui()->NuiHudCheck(tracking_id);
+  if (result) {
+    return result;
+  }
+  return XamShowAchievementsUI_entry(user_index, title_id);
+}
+DECLARE_XAM_EXPORT1(XamShowNuiAchievementsUI, kUserProfiles, kSketchy);
+
+dword_result_t XamShowNuiFriendsUI_entry(dword_t tracking_id,
+                                         dword_t user_index) {
+  XELOGD("XamShowNuiFriendsUI({:08X}, {:08X})", tracking_id.value(),
+         user_index.value());
+  auto result = kernel_state()->nui()->NuiHudCheck(tracking_id);
+  if (result) {
+    return result;
+  }
+  return X_ERROR_FUNCTION_FAILED;
+}
+DECLARE_XAM_EXPORT1(XamShowNuiFriendsUI, kUI, kStub);
+
+dword_result_t XamShowNuiGamerCardUIForXUID_entry(dword_t tracking_id,
+                                                  dword_t user_index,
+                                                  qword_t xuid) {
+  XELOGD("XamShowNuiGamerCardUIForXUID({:08X}, {:08X}, {:016X})",
+         tracking_id.value(), user_index.value(), xuid.value());
+  auto result = kernel_state()->nui()->NuiHudCheck(tracking_id);
+  if (result) {
+    return result;
+  }
+  return X_ERROR_FUNCTION_FAILED;
+}
+DECLARE_XAM_EXPORT1(XamShowNuiGamerCardUIForXUID, kUI, kStub);
+
+dword_result_t XamShowNuiControllerRequiredUI_entry(dword_t tracking_id,
+                                                    dword_t unk2,
+                                                    dword_t unk3) {
+  // Asks the player to pick up a controller. Treat as dismissed.
+  XELOGD("XamShowNuiControllerRequiredUI({:08X}, {:08X}, {:08X})",
+         tracking_id.value(), unk2.value(), unk3.value());
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamShowNuiControllerRequiredUI, kUI, kStub);
+
 dword_result_t XamShowGamerCardUI_entry(dword_t user_index) {
   auto user = kernel_state()->xam_state()->GetUserProfile(user_index);
   if (!user) {
@@ -1170,6 +1234,127 @@ dword_result_t XamShowEditProfileUI_entry(dword_t user_index) {
 }
 DECLARE_XAM_EXPORT1(XamShowEditProfileUI, kUserProfiles, kImplemented);
 
+// The Kinect Tuner a title opens (Y in Just Dance's menus) with
+// XamShowNuiTroubleshooterUI. The console's own tuner is part of its system
+// software, not of the title; this one shows what the Kinect sees, through
+// the SDK bridge (everyone's outline in their colour), and moves the tilt
+// motor.
+class KinectTunerDialog : public XamDialog {
+ public:
+  explicit KinectTunerDialog(xe::ui::ImGuiDrawer* imgui_drawer)
+      : XamDialog(imgui_drawer) {}
+
+  void OnDraw(ImGuiIO& io) override {
+    static const char kTitle[] = "Kinect Tuner";
+    if (!has_opened_) {
+      ImGui::OpenPopup(kTitle);
+      has_opened_ = true;
+    }
+    if (!ImGui::BeginPopupModal(kTitle, nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+      Close();
+      return;
+    }
+    xboxkrnl::KinectTunerView view;
+    xboxkrnl::KinectGetTunerView(&view);
+    if (view.real_kinect) {
+      ImGui::TextUnformatted(
+          "Real Kinect: the game tracks you itself from the camera.");
+    } else if (view.bridge) {
+      ImGui::Text("Kinect SDK bridge: %u %s in view, %u with a full skeleton",
+                  view.people, view.people == 1 ? "person" : "people",
+                  view.full_skeletons);
+    } else {
+      ImGui::TextUnformatted(
+          "No Kinect data. Start KinectSdkBridge.exe, then open the tuner "
+          "again.");
+    }
+
+    // The camera view: distance in grey, each player in their colour.
+    constexpr float kCell = 5.0f;
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const float width = xboxkrnl::KinectTunerView::kWidth * kCell;
+    const float height = xboxkrnl::KinectTunerView::kHeight * kCell;
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    draw_list->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height),
+                             IM_COL32(0, 0, 0, 255));
+    static const uint8_t kColours[7][3] = {
+        {0, 0, 0},     {0, 160, 255}, {0, 220, 90},  {255, 150, 0},
+        {255, 70, 110}, {240, 230, 0}, {150, 255, 230}};
+    if (view.have_image) {
+      for (uint32_t y = 0; y < xboxkrnl::KinectTunerView::kHeight; ++y) {
+        for (uint32_t x = 0; x < xboxkrnl::KinectTunerView::kWidth; ++x) {
+          const uint32_t i = y * xboxkrnl::KinectTunerView::kWidth + x;
+          const uint32_t grey = view.grey[i];
+          const uint32_t player = std::min<uint32_t>(view.player[i], 6);
+          ImU32 colour;
+          if (player) {
+            colour = IM_COL32(grey / 3 + kColours[player][0] * 2 / 3,
+                              grey / 3 + kColours[player][1] * 2 / 3,
+                              grey / 3 + kColours[player][2] * 2 / 3, 255);
+          } else {
+            colour = IM_COL32(grey / 2, grey / 2, grey / 2, 255);
+          }
+          const ImVec2 a(origin.x + x * kCell, origin.y + y * kCell);
+          draw_list->AddRectFilled(a, ImVec2(a.x + kCell, a.y + kCell),
+                                   colour);
+        }
+      }
+    } else {
+      draw_list->AddText(ImVec2(origin.x + 10, origin.y + 10),
+                         IM_COL32(200, 200, 200, 255),
+                         view.real_kinect
+                             ? "(no camera picture in real-Kinect mode yet)"
+                             : "(no camera picture)");
+    }
+    ImGui::Dummy(ImVec2(width, height));
+
+    ImGui::TextUnformatted(
+        "Stand 2-3 m from the Kinect. Tilt it until your whole body, from "
+        "head to feet, shows in colour.");
+    if (view.have_tilt) {
+      if (!have_target_) {
+        target_ = view.tilt_degrees;
+        have_target_ = true;
+      }
+      ImGui::Text("Tilt: %d degrees%s", view.tilt_degrees,
+                  view.tilt_moving ? " (moving)" : "");
+    } else {
+      ImGui::TextUnformatted("Tilt: not available");
+    }
+    ImGui::BeginDisabled(!view.have_tilt);
+    if (ImGui::Button("Tilt up")) {
+      Tilt(target_ + 3);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Tilt down")) {
+      Tilt(target_ - 3);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Level")) {
+      Tilt(0);
+    }
+    ImGui::EndDisabled();
+    ImGui::TextUnformatted("The microphone test isn't emulated.");
+    ImGui::Spacing();
+    if (ImGui::Button("Done")) {
+      ImGui::CloseCurrentPopup();
+      Close();
+    }
+    ImGui::EndPopup();
+  }
+
+ private:
+  void Tilt(int32_t degrees) {
+    target_ = std::clamp(degrees, -27, 27);
+    xboxkrnl::KinectBridgeRequestTilt(target_);
+  }
+
+  bool has_opened_ = false;
+  bool have_target_ = false;
+  int32_t target_ = 0;
+};
+
 // UI
 dword_result_t XamShowNuiTroubleshooterUI_entry(dword_t user_index,
                                                 dword_t tracking_id,
@@ -1203,6 +1388,16 @@ dword_result_t XamShowNuiTroubleshooterUI_entry(dword_t user_index,
   const Emulator* emulator = kernel_state()->emulator();
   xe::ui::Window* display_window = emulator->display_window();
   xe::ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
+  // The Kinect Tuner, unless the title says a Kinect is required
+  // (XamShowNuiHardwareRequiredUI) and there is none.
+  xboxkrnl::KinectTunerView view;
+  const bool kinect = xboxkrnl::KinectGetTunerView(&view);
+  if (display_window && imgui_drawer && (kinect || !(flags & 0x400000))) {
+    kernel_state()->xam_state()->is_xam_dialog_present_.store(true);
+    return xeXamDispatchDialog<KinectTunerDialog>(
+        new KinectTunerDialog(imgui_drawer),
+        [](KinectTunerDialog*) -> X_RESULT { return X_ERROR_SUCCESS; }, 0);
+  }
   if (display_window && imgui_drawer) {
     xe::threading::Fence fence;
     if (display_window->app_context().CallInUIThreadSynchronous([&]() {

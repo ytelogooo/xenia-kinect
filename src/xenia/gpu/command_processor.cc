@@ -8,6 +8,7 @@
  */
 
 #include "xenia/gpu/command_processor.h"
+#include "xenia/gpu/draw_util.h"
 
 #include <algorithm>
 
@@ -1379,5 +1380,23 @@ void CommandProcessor::PumpPendingRetire() {
 
 #define COMMAND_PROCESSOR CommandProcessor
 #include "pm4_command_processor_implement.h"
+bool CommandProcessor::IssueCopyRectangles(xenos::PrimitiveType primitive_type,
+                                           uint32_t vertex_count) {
+  draw_util::ResolveRectangle layout;
+  const uint32_t rectangle_count = draw_util::GetResolveRectangleLayout(
+      *register_file_, *memory_, primitive_type, vertex_count, layout);
+  bool success = true;
+  for (uint32_t i = 0; i < rectangle_count; ++i) {
+    draw_util::ResolveRectangle rectangle = layout;
+    rectangle.first_vertex = i * 3;
+    draw_util::SetResolveRectangle(rectangle);
+    if (!IssueCopy()) {
+      success = false;
+    }
+  }
+  draw_util::SetResolveRectangle({});
+  return success;
+}
+
 }  // namespace gpu
 }  // namespace xe

@@ -1609,6 +1609,261 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
   return copied && cleared;
 }
 
+bool D3D12RenderTargetCache::ResolveRectangles(
+    const Memory& memory, D3D12SharedMemory& shared_memory,
+    D3D12TextureCache& texture_cache,
+    const draw_util::ResolveRectangle& layout, uint32_t rectangle_count,
+    std::vector<std::pair<uint32_t, uint32_t>>& written_ranges_out,
+    ResolveRectanglesFallback& fallback_out) {
+  written_ranges_out.clear();
+  fallback_out = ResolveRectanglesFallback::kNone;
+  // Resolve does the same as below for every rectangle, but dumps the render
+  // targets right before each copy and clears right after it, so the EDRAM
+  // buffer goes UAV > SRV > UAV, the render targets SRV > render target > SRV,
+  // and the copy destination gets a UAV barrier, around every rectangle. With
+  // the Kinect NUI runtime resolving thousands of tiny rectangles per frame,
+  // those GPU stalls cost most of the frame.
+  if (rectangle_count < 2 || GetPath() != Path::kHostRenderTargets ||
+      IsDrawResolutionScaled()) {
+    fallback_out = ResolveRectanglesFallback::kNotApplicable;
+    return false;
+  }
+
+  // Gather everything first, so nothing has been done yet if the rectangles
+  // can't be batched.
+  bool fixed_16_truncated_to_minus_1_to_1 = IsFixed16TruncatedToMinus1To1();
+  batched_resolves_.clear();
+  batched_resolves_.reserve(rectangle_count);
+  bool copy_native = false;
+  bool any_copy = false;
+  bool clearing = false;
+  draw_util::ResolveRectangle rectangle = layout;
+  for (uint32_t i = 0; i < rectangle_count; ++i) {
+    rectangle.first_vertex = i * 3;
+    draw_util::SetResolveRectangle(rectangle);
+    BatchedResolve resolve;
+    if (!draw_util::GetResolveInfo(register_file(), memory, trace_writer_, 1,
+                                   1, fixed_16_truncated_to_minus_1_to_1,
+                                   fixed_16_truncated_to_minus_1_to_1,
+                                   resolve.info)) {
+      fallback_out = ResolveRectanglesFallback::kInfo;
+      return false;
+    }
+    if (!resolve.info.coordinate_info.width_div_8 ||
+        !resolve.info.height_div_8) {
+      // Nothing to copy or clear - skipped like Resolve does.
+      continue;
+    }
+    bool clear_depth = resolve.info.IsClearingDepth();
+    bool clear_color = resolve.info.IsClearingColor();
+    if (clear_depth || clear_color) {
+      // Clearing only the copied EDRAM region (or only clearing): the clear of
+      // one rectangle can then only change what a later one copies where the
+      // rectangles overlap, which is checked below. A depth clear alongside a
+      // color copy (or the other way around) touches another region that may
+      // alias something copied - not batched.
+      if (resolve.info.copy_dest_extent_length &&
+          (resolve.info.IsCopyingDepth() ? clear_color : clear_depth)) {
+        fallback_out = ResolveRectanglesFallback::kClearOtherRegion;
+        return false;
+      }
+      if (clear_depth && clear_color) {
+        fallback_out = ResolveRectanglesFallback::kClearOtherRegion;
+        return false;
+      }
+      clearing = true;
+    }
+    resolve.copy = resolve.info.copy_dest_extent_length != 0;
+    if (!resolve.copy && !clear_depth && !clear_color) {
+      continue;
+    }
+    if (resolve.copy) {
+      uint32_t dump_base, dump_row_length_used, dump_rows, dump_pitch;
+      resolve.info.GetCopyEdramTileSpan(dump_base, dump_row_length_used,
+                                        dump_rows, dump_pitch);
+      bool rectangle_copy_native = IsResolveSourceNativeOnly(
+          dump_base, dump_row_length_used, dump_rows, dump_pitch);
+      if (!any_copy) {
+        copy_native = rectangle_copy_native;
+        any_copy = true;
+      } else if (rectangle_copy_native != copy_native) {
+        // Dumped with different layouts - keep each dump right before its
+        // copy.
+        fallback_out = ResolveRectanglesFallback::kNativeLayout;
+        return false;
+      }
+      resolve.shader = resolve.info.GetCopyShader(1, 1, resolve.constants,
+                                                  resolve.group_count_x,
+                                                  resolve.group_count_y);
+      if (resolve.shader == draw_util::ResolveCopyShaderIndex::kUnknown ||
+          !resolve.group_count_x || !resolve.group_count_y) {
+        fallback_out = ResolveRectanglesFallback::kShader;
+        return false;
+      }
+    }
+    // The covered EDRAM samples, relatively to the original base, for the
+    // overlap check.
+    const draw_util::ResolveEdramInfo& edram_info =
+        resolve.info.IsCopyingDepth() || clear_depth
+            ? resolve.info.depth_edram_info
+            : resolve.info.color_edram_info;
+    uint32_t original_base = resolve.info.IsCopyingDepth() || clear_depth
+                                 ? resolve.info.depth_original_base
+                                 : resolve.info.color_original_base;
+    uint32_t is_64bpp = edram_info.format_is_64bpp;
+    uint32_t offset_tiles =
+        ((edram_info.base_tiles - original_base) &
+         ((uint32_t(1) << xenos::kEdramBaseTilesBits) - 1)) >>
+        is_64bpp;
+    uint32_t pitch_tiles = std::max(uint32_t(edram_info.pitch_tiles) >> is_64bpp,
+                                    uint32_t(1));
+    uint32_t samples_x_log2 =
+        uint32_t(edram_info.msaa_samples >= xenos::MsaaSamples::k4X);
+    uint32_t samples_y_log2 =
+        uint32_t(edram_info.msaa_samples >= xenos::MsaaSamples::k2X);
+    resolve.x0 = (offset_tiles % pitch_tiles) * xenos::kEdramTileWidthSamples +
+                 (uint32_t(resolve.info.coordinate_info.edram_offset_x_div_8)
+                  << (samples_x_log2 + 3));
+    resolve.y0 = (offset_tiles / pitch_tiles) * xenos::kEdramTileHeightSamples +
+                 (uint32_t(resolve.info.coordinate_info.edram_offset_y_div_8)
+                  << (samples_y_log2 + 3));
+    resolve.x1 = resolve.x0 +
+                 (uint32_t(resolve.info.coordinate_info.width_div_8)
+                  << (samples_x_log2 + 3));
+    resolve.y1 =
+        resolve.y0 + (resolve.info.height_div_8 << (samples_y_log2 + 3));
+    batched_resolves_.push_back(resolve);
+  }
+  if (batched_resolves_.empty()) {
+    return true;
+  }
+  if (clearing) {
+    // Batching does all the copies before all the clears - fine only if no
+    // rectangle copies what an earlier one cleared.
+    if (batched_resolves_.size() > 4096) {
+      fallback_out = ResolveRectanglesFallback::kOverlap;
+      return false;
+    }
+    for (size_t i = 1; i < batched_resolves_.size(); ++i) {
+      const BatchedResolve& later = batched_resolves_[i];
+      for (size_t j = 0; j < i; ++j) {
+        const BatchedResolve& earlier = batched_resolves_[j];
+        if (later.x0 < earlier.x1 && earlier.x0 < later.x1 &&
+            later.y0 < earlier.y1 && earlier.y0 < later.y1) {
+          fallback_out = ResolveRectanglesFallback::kOverlap;
+          return false;
+        }
+      }
+    }
+  }
+
+  if (any_copy) {
+    // Dump the render targets owning all the rectangles to the EDRAM buffer.
+    // The render targets aren't modified until all the copies are done, so
+    // later dumps rewrite overlapping tiles with the same data, and every copy
+    // reads what it would have read right after its own dump.
+    for (const BatchedResolve& resolve : batched_resolves_) {
+      if (!resolve.copy) {
+        continue;
+      }
+      uint32_t dump_base, dump_row_length_used, dump_rows, dump_pitch;
+      resolve.info.GetCopyEdramTileSpan(dump_base, dump_row_length_used,
+                                        dump_rows, dump_pitch);
+      DumpRenderTargets(dump_base, dump_row_length_used, dump_rows,
+                        dump_pitch, copy_native);
+    }
+
+    // Make sure there is memory to write to (may upload, changing the shared
+    // memory state, so before the copies).
+    bool copy_dest_committed = true;
+    for (const BatchedResolve& resolve : batched_resolves_) {
+      if (resolve.copy &&
+          !shared_memory.RequestRange(resolve.info.copy_dest_extent_start,
+                                      resolve.info.copy_dest_extent_length)) {
+        XELOGE(
+            "D3D12RenderTargetCache: Failed to obtain the resolve destination "
+            "memory region");
+        copy_dest_committed = false;
+        break;
+      }
+    }
+
+    if (copy_dest_committed) {
+      // All the copies, with the EDRAM buffer and shared memory states set
+      // once. The rectangles share the copy registers, so where their
+      // destinations overlap, they write the same values - no UAV barriers
+      // needed between them.
+      DeferredCommandList& command_list =
+          command_processor_.GetDeferredCommandList();
+      TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      shared_memory.UseForWriting();
+      command_list.D3DSetComputeRootSignature(
+          copy_native ? resolve_copy_native_root_signature_
+                      : resolve_copy_root_signature_);
+      command_list.D3DSetComputeRootShaderResourceView(
+          2, edram_buffer_gpu_address_);
+      command_list.D3DSetComputeRootUnorderedAccessView(
+          1, shared_memory.GetGPUAddress());
+      command_processor_.SubmitBarriers();
+      for (const BatchedResolve& resolve : batched_resolves_) {
+        if (!resolve.copy) {
+          continue;
+        }
+        command_list.D3DSetComputeRoot32BitConstants(
+            0, sizeof(resolve.constants) / sizeof(uint32_t),
+            &resolve.constants, 0);
+        command_processor_.SetExternalPipeline(
+            copy_native
+                ? resolve_copy_native_pipelines_[size_t(resolve.shader)]
+                : resolve_copy_pipelines_[size_t(resolve.shader)]);
+        command_list.D3DDispatch(resolve.group_count_x, resolve.group_count_y,
+                                 1);
+      }
+      // Order the copies with other work using shared memory as a UAV.
+      shared_memory.MarkUAVWritesCommitNeeded();
+
+      // Invalidate textures.
+      for (const BatchedResolve& resolve : batched_resolves_) {
+        if (!resolve.copy) {
+          continue;
+        }
+        texture_cache.MarkRangeAsResolved(resolve.info.copy_dest_extent_start,
+                                          resolve.info.copy_dest_extent_length,
+                                          false);
+        written_ranges_out.emplace_back(resolve.info.copy_dest_extent_start,
+                                        resolve.info.copy_dest_extent_length);
+      }
+    }
+  }
+
+  if (clearing) {
+    // The clears, in order, as Resolve does them after each copy.
+    for (const BatchedResolve& resolve : batched_resolves_) {
+      if (!resolve.info.IsClearingDepth() && !resolve.info.IsClearingColor()) {
+        continue;
+      }
+      Transfer::Rectangle clear_rectangle;
+      RenderTarget* clear_render_targets[2];
+      if (PrepareHostRenderTargetsResolveClear(
+              resolve.info, clear_rectangle, clear_render_targets[0],
+              clear_transfers_[0], clear_render_targets[1],
+              clear_transfers_[1])) {
+        uint64_t clear_values[2];
+        clear_values[0] = resolve.info.rb_depth_clear;
+        clear_values[1] =
+            resolve.info.color_edram_info.format_is_64bpp
+                ? resolve.info.rb_color_clear_lo |
+                      (uint64_t(resolve.info.rb_color_clear) << 32)
+                : resolve.info.rb_color_clear;
+        PerformTransfersAndResolveClears(2, clear_render_targets,
+                                         clear_transfers_, clear_values,
+                                         &clear_rectangle);
+      }
+    }
+  }
+  return true;
+}
+
 bool D3D12RenderTargetCache::InitializeTraceSubmitDownloads() {
   if (IsDrawResolutionScaled()) {
     // No 1:1 mapping.

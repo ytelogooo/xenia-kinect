@@ -9,14 +9,24 @@
 
 #include "xenia/kernel/nui.h"
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/xbox.h"
+
+DEFINE_bool(kinect_connected, false,
+            "Report a connected, ready Kinect sensor to titles even if the "
+            "\"Kinect Initialized\" retail flag is not set in console "
+            "settings. No real sensor data is provided yet.",
+            "Kernel");
 
 namespace xe {
 namespace kernel {
 NUIController::NUIController() {};
 bool NUIController::NuiInitialized() {
   // TODO(boma): Proper device readiness.
+  if (cvars::kinect_connected) {
+    return true;
+  }
   return (KernelState::shared()->xconfig()->ReadSetting<uint32_t>(
               X_CONFIG_CATEGORY::XCONFIG_USER_CATEGORY,
               XCONFIG_USER_RETAIL_FLAGS) &

@@ -20,6 +20,12 @@ DEFINE_bool(
     "Certain titles check if result matches provided lower range.",
     "Memory");
 
+DEFINE_bool(trace_game_io, false,
+            "Log every NtReadFile (path, offset, length, result, first bytes) "
+            "and NtAllocateVirtualMemory (requested vs. returned) the title "
+            "makes, to track down corrupted sizes and counts.",
+            "Kernel");
+
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
@@ -108,6 +114,9 @@ dword_result_t NtAllocateVirtualMemory_entry(lpdword_t base_addr_ptr,
     XELOGW("Game setting EXECUTE bit on allocation");
   }
 
+  const uint32_t trace_req_base = *base_addr_ptr;
+  const uint32_t trace_req_size = *region_size_ptr;
+
   uint32_t page_size;
   if (*base_addr_ptr != 0) {
     // ignore specified page size when base address is specified.
@@ -177,6 +186,15 @@ dword_result_t NtAllocateVirtualMemory_entry(lpdword_t base_addr_ptr,
     heap = kernel_memory()->LookupHeapByType(false, page_size);
     heap->Alloc(adjusted_size, page_size, allocation_type, protect, top_down,
                 &address);
+  }
+  if (cvars::trace_game_io) {
+    XELOGI(
+        "NtAllocateVirtualMemory: base={:08X} size={:08X}{} type={:08X} "
+        "protect={:08X} -> {}{:08X} (size {:08X})",
+        trace_req_base, trace_req_size,
+        int32_t(trace_req_size) < 0 ? " NEGATIVE" : "", uint32_t(alloc_type),
+        uint32_t(protect_bits), address ? "" : "FAILED ", address,
+        adjusted_size);
   }
   if (!address) {
     // Failed - assume no memory available.

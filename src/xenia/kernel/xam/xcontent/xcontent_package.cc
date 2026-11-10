@@ -114,6 +114,18 @@ bool ContentPackage::RegisterRootName(string_key_insensitive root_name) {
   return true;
 }
 
+void ContentPackage::DetachRootName() {
+  if (!root_name_) {
+    return;
+  }
+  std::string root_name = std::string(root_name_.value().view());
+  if (!root_name.ends_with(':')) {
+    root_name.append(":");
+  }
+  file_system_->UnregisterSymbolicLink(root_name);
+  root_name_ = std::nullopt;
+}
+
 XCONTENT_DATA_INTERNAL ContentPackage::GetContentMetadata() const {
   XCONTENT_DATA_INTERNAL metadata{};
 

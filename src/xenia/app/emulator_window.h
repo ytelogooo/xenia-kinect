@@ -10,8 +10,10 @@
 #ifndef XENIA_APP_EMULATOR_WINDOW_H_
 #define XENIA_APP_EMULATOR_WINDOW_H_
 
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "xenia/app/profile_dialogs.h"
 #include "xenia/emulator.h"
@@ -319,6 +321,14 @@ class EmulatorWindow {
 
   std::string base_title_;
   bool initializing_shader_storage_ = false;
+
+  // show_fps: frames the title presented in the last second, updated by
+  // fps_thread_.
+  void StartFpsCounter();
+  void StopFpsCounter();
+  std::thread fps_thread_;
+  std::atomic<bool> fps_thread_running_ = false;
+  std::atomic<double> fps_ = -1.0;
 
   std::unique_ptr<DisplayConfigDialog> display_config_dialog_;
   std::unique_ptr<ConsoleSettingsDialog> console_settings_dialog_;

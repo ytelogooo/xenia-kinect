@@ -18,6 +18,10 @@ namespace xboxkrnl {
 
 void VdQueryVideoMode(X_VIDEO_MODE* video_mode, bool is_internal_resolution);
 
+// Number of frames the title has presented (VdSwap calls), for frame rate
+// display.
+uint64_t GetVdSwapCount();
+
 }  // namespace xboxkrnl
 }  // namespace kernel
 }  // namespace xe

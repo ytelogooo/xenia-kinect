@@ -11,6 +11,7 @@
 #define XENIA_CPU_PPC_PPC_FRONTEND_H_
 
 #include <memory>
+#include <unordered_map>
 
 #include "xenia/base/type_pool.h"
 #include "xenia/cpu/function.h"
@@ -27,6 +28,15 @@ namespace cpu {
 namespace ppc {
 
 class PPCTranslator;
+struct PPCContext_s;
+
+// Host callbacks that run just before a guest instruction executes. Emulated
+// peripherals use them to supply data at a known point in title code (for
+// example the emulated Kinect filling in skeleton frames). Register before
+// the containing guest function is first translated, e.g. while kernel
+// modules are being created.
+using GuestHookHandler = void (*)(PPCContext_s* context, uint32_t address);
+void RegisterGuestHook(uint32_t address, GuestHookHandler handler);
 
 struct PPCBuiltins {
   int32_t global_lock_count;
@@ -34,6 +44,8 @@ struct PPCBuiltins {
   Function* enter_global_lock;
   Function* leave_global_lock;
   Function* syscall_handler;
+  // Diagnostic probes from --probe_guest_addresses, keyed by guest address.
+  std::unordered_map<uint32_t, Function*> probes;
 };
 
 class PPCFrontend {
@@ -46,6 +58,9 @@ class PPCFrontend {
   Processor* processor() const { return processor_; }
   Memory* memory() const;
   PPCBuiltins* builtins() { return &builtins_; }
+
+  // Builtin calling the hook registered for address, or nullptr.
+  Function* GetGuestHookFunction(uint32_t address);
 
   bool DeclareFunction(GuestFunction* function);
   bool DefineFunction(GuestFunction* function, uint32_t debug_info_flags);

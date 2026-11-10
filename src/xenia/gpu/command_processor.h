@@ -527,6 +527,10 @@ class CommandProcessor {
     return false;
   }
   virtual bool IssueCopy() { return false; }
+  // Copy-mode draw: resolves each rectangle of a rectangle list separately
+  // (Direct3D 9 only ever draws one; see draw_util::ResolveRectangle).
+  bool IssueCopyRectangles(xenos::PrimitiveType primitive_type,
+                           uint32_t vertex_count);
 
   // "Actual" is for the command processor thread, to be read by the
   // implementations.

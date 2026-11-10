@@ -15,6 +15,7 @@
 #include "xenia/kernel/xboxkrnl/cert_monitor.h"
 #include "xenia/kernel/xboxkrnl/debug_monitor.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_usb_kinect.h"
 
 DEFINE_string(cl, "", "Specify additional command-line provided to guest.",
               "Kernel");
@@ -264,7 +265,7 @@ void XboxkrnlModule::RegisterExportTable(
   export_resolver->RegisterTable("xboxkrnl.exe", &xboxkrnl_exports);
 }
 
-XboxkrnlModule::~XboxkrnlModule() = default;
+XboxkrnlModule::~XboxkrnlModule() { usb_kinect::Shutdown(); }
 
 }  // namespace xboxkrnl
 }  // namespace kernel

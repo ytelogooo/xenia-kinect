@@ -76,6 +76,9 @@ class ContentPackage {
   std::filesystem::path GetPackageHostPath() const { return host_path_; }
 
   bool RegisterRootName(string_key_insensitive root_name);
+  // Drops the root name and its symbolic link but keeps the device registered,
+  // so files that are still open in the package keep working.
+  void DetachRootName();
   std::optional<string_key_insensitive> GetRootName() const {
     return root_name_;
   }

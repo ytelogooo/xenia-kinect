@@ -1434,6 +1434,47 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   for (int i = 0; i < 32; i++) {
     crash_msg.append(fmt::format(" r{:<3} = {:016X}\n", i, context->r[i]));
   }
+  crash_msg.append(
+      fmt::format(" lr   = {:016X}\n ctr  = {:016X}\n", context->lr,
+                  context->ctr));
+  // Call chain hints. Guest frames do not keep a back chain, so scan the stack
+  // for words that point just after a call (bl/bctrl) inside the executable
+  // image. Innermost first; stale words can show up as well.
+  {
+    const uint32_t sp = static_cast<uint32_t>(context->r[1]);
+    uint32_t image_base = 0;
+    uint32_t image_end = 0;
+    if (auto module = kernel_state_->GetExecutableModule()) {
+      if (auto xex = module->xex_module()) {
+        image_base = xex->base_address();
+        image_end = image_base + xex->image_size();
+      }
+    }
+    const uint32_t stack_top = current_thread->stack_base();
+    const uint32_t stack_low = current_thread->stack_limit();
+    if (image_end && sp >= stack_low && sp < stack_top) {
+      crash_msg.append("Stack scan (return address candidates):\n");
+      const uint32_t scan_end = std::min<uint32_t>(stack_top, sp + 0x2000);
+      uint32_t found = 0;
+      for (uint32_t addr = sp & ~3u; addr + 4 <= scan_end && found < 64;
+           addr += 4) {
+        const uint32_t value = xe::load_and_swap<uint32_t>(
+            memory_->TranslateVirtual<const uint8_t*>(addr));
+        if ((value & 3) || value <= image_base || value > image_end) {
+          continue;
+        }
+        const uint32_t prev = xe::load_and_swap<uint32_t>(
+            memory_->TranslateVirtual<const uint8_t*>(value - 4));
+        const bool is_bl = (prev >> 26) == 18 && (prev & 1);
+        const bool is_bctrl = (prev & 0xFC00FFFF) == 0x4C000421;
+        if (is_bl || is_bctrl) {
+          crash_msg.append(
+              fmt::format("  [sp+0x{:04X}] {:08X}\n", addr - sp, value));
+          ++found;
+        }
+      }
+    }
+  }
   for (int i = 0; i < 32; i++) {
     crash_msg.append(fmt::format(" f{:<3} = {:016X} = (double){} = (float){}\n",
                                  i,

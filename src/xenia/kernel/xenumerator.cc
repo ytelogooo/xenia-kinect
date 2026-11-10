@@ -9,6 +9,17 @@
 
 #include "xenia/kernel/xenumerator.h"
 
+#include <algorithm>
+
+#include "xenia/base/cvar.h"
+#include "xenia/base/logging.h"
+
+DEFINE_bool(content_enumerator_cap_total, false,
+            "Never report more content items in total than the title asked "
+            "for per XEnumerate call. Just Dance 2015 asks for 8 and crashes "
+            "when more DLC packages than that are installed.",
+            "Kernel");
+
 namespace xe {
 namespace kernel {
 
@@ -251,8 +262,21 @@ uint32_t ProfileEnumerator::WriteItems(uint8_t* buffer_data,
 uint32_t ContentEnumerator::WriteItems(uint8_t* buffer_data,
                                        uint32_t buffer_size,
                                        uint32_t* written_count) {
+  size_t total_items = items_.size();
+  if (cvars::content_enumerator_cap_total &&
+      total_items > items_per_enumerate()) {
+    if (current_item_ == 0) {
+      XELOGW(
+          "ContentEnumerator: reporting only the first {} of {} items "
+          "(content_enumerator_cap_total)",
+          items_per_enumerate(), total_items);
+    }
+    total_items = items_per_enumerate();
+  }
+  const size_t remaining_items =
+      total_items > current_item_ ? total_items - current_item_ : 0;
   const size_t actual_count =
-      std::min(items_.size() - current_item_, items_per_enumerate());
+      std::min(remaining_items, items_per_enumerate());
   if (!actual_count) {
     return X_ERROR_NO_MORE_FILES;
   }

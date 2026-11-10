@@ -7,6 +7,10 @@
  ******************************************************************************
  */
 
+#include <algorithm>
+#include <cstring>
+
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/kernel_state.h"
@@ -19,6 +23,8 @@
 #include "xenia/kernel/xthread.h"
 #include "xenia/vfs/device.h"
 #include "xenia/xbox.h"
+
+DECLARE_bool(trace_game_io);
 
 namespace xe {
 namespace kernel {
@@ -111,6 +117,11 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
 
   *handle_out = handle;
 
+  if (cvars::trace_game_io) {
+    XELOGI("NtCreateFile: '{}' -> {:08X} handle={:08X}", target_path,
+           uint32_t(result), uint32_t(handle));
+  }
+
   return result;
 }
 DECLARE_XBOXKRNL_EXPORT1(NtCreateFile, kFileSystem, kImplemented);
@@ -150,10 +161,27 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
     if (true || file->is_synchronous()) {
       // Synchronous.
       uint32_t bytes_read = 0;
-      result = file->Read(
-          buffer.guest_address(), buffer_length,
-          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
-          &bytes_read, apc_context, true, &pending);
+      const uint64_t read_offset =
+          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1;
+      result = file->Read(buffer.guest_address(), buffer_length, read_offset,
+                          &bytes_read, apc_context, true, &pending);
+      if (cvars::trace_game_io) {
+        uint8_t head[8] = {};
+        const uint32_t head_len = std::min<uint32_t>(bytes_read, 8);
+        if (head_len) {
+          std::memcpy(head, kernel_memory()->TranslateVirtual(
+                                buffer.guest_address()),
+                      head_len);
+        }
+        XELOGI(
+            "NtReadFile: handle={:08X} '{}' off={:X} len={:X} -> {:08X} "
+            "read={:X} data={:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}",
+            uint32_t(file_handle),
+            file->entry() ? file->entry()->path() : std::string("?"),
+            read_offset, uint32_t(buffer_length), uint32_t(result), bytes_read,
+            head[0], head[1], head[2], head[3], head[4], head[5], head[6],
+            head[7]);
+      }
 
       if (io_status_block) {
         io_status_block->status = result;

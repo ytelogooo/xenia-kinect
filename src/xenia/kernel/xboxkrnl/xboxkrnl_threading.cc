@@ -738,6 +738,58 @@ void KeInitializeSemaphore_entry(pointer_t<X_KSEMAPHORE> semaphore_ptr,
 }
 DECLARE_XBOXKRNL_EXPORT1(KeInitializeSemaphore, kThreading, kImplemented);
 
+// Guest-allocated mutant (KMUTANT). The Kinect NUI 2.0.21xxx runtime uses
+// these; before this, the call did nothing and later waits on the
+// uninitialised struct never returned.
+void KeInitializeMutant_entry(pointer_t<X_KMUTANT> mutant_ptr,
+                              dword_t initial_owner) {
+  const uint32_t guest = mutant_ptr.guest_address();
+  mutant_ptr->header.type = X_OBJECT_TYPES::MutantObject;
+  mutant_ptr->header.signal_state = initial_owner ? 0 : 1;
+  // Empty wait list (also drops any stale native object handle stashed there
+  // by an earlier object at this address).
+  mutant_ptr->header.wait_list.flink_ptr = guest + 0x8;
+  mutant_ptr->header.wait_list.blink_ptr = guest + 0x8;
+  mutant_ptr->unk_list.flink_ptr = 0;
+  mutant_ptr->unk_list.blink_ptr = 0;
+  mutant_ptr->owner = initial_owner
+                          ? XThread::GetCurrentThread()->guest_object()
+                          : 0;
+  mutant_ptr->abandoned = false;
+
+  auto mutant = XObject::GetNativeObject<XMutant>(kernel_state(), mutant_ptr,
+                                                  X_OBJECT_TYPES::MutantObject);
+  if (!mutant) {
+    assert_always();
+  }
+}
+DECLARE_XBOXKRNL_EXPORT1(KeInitializeMutant, kThreading, kImplemented);
+
+dword_result_t KeReleaseMutant_entry(pointer_t<X_KMUTANT> mutant_ptr,
+                                     dword_t increment, dword_t abandon,
+                                     dword_t wait) {
+  auto mutant = XObject::GetNativeObject<XMutant>(kernel_state(), mutant_ptr,
+                                                  X_OBJECT_TYPES::MutantObject);
+  if (!mutant) {
+    assert_always();
+    return 0;
+  }
+  const int32_t previous = int32_t(uint32_t(mutant_ptr->header.signal_state));
+  if (mutant->ReleaseMutant(increment, false, false) != X_STATUS_SUCCESS) {
+    XELOGW("KeReleaseMutant({:08X}): not owned by the calling thread",
+           mutant_ptr.guest_address());
+    return previous;
+  }
+  if (previous < 1) {
+    mutant_ptr->header.signal_state = previous + 1;
+    if (previous + 1 == 1) {
+      mutant_ptr->owner = 0;
+    }
+  }
+  return previous;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeReleaseMutant, kThreading, kImplemented);
+
 uint32_t xeKeReleaseSemaphore(X_KSEMAPHORE* semaphore_ptr, uint32_t increment,
                               uint32_t adjustment, uint32_t wait) {
   auto sem = XObject::GetNativeObject<XSemaphore>(kernel_state(), semaphore_ptr,

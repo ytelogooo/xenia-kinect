@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/draw_util.h"
 
+#include <cmath>
+
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -1236,6 +1238,115 @@ constexpr ResolveCopyShaderInfo
         {"Resolve Copy Full 128bpp", 4, 3},
         {"Resolve Copy DXT3A as 1_1_1_1", 8, 3},
 };
+namespace {
+ResolveRectangle current_resolve_rectangle;
+
+// Reads vertex `index` (x, y) of vertex fetch 0 with the given stride.
+void ReadResolveVertex(const Memory& memory,
+                       const xenos::xe_gpu_vertex_fetch_t& fetch,
+                       uint32_t index, uint32_t stride_dwords, float& x,
+                       float& y) {
+  const float* base = reinterpret_cast<const float*>(memory.TranslatePhysical(
+      (fetch.address + index * stride_dwords) * sizeof(uint32_t)));
+  x = xenos::GpuSwap(base[0], fetch.endian);
+  y = xenos::GpuSwap(base[1], fetch.endian);
+}
+
+bool IsAxisAlignedResolveRectangle(const Memory& memory,
+                                   const xenos::xe_gpu_vertex_fetch_t& fetch,
+                                   uint32_t first_vertex,
+                                   uint32_t stride_dwords) {
+  float x[3], y[3];
+  for (uint32_t i = 0; i < 3; ++i) {
+    ReadResolveVertex(memory, fetch, first_vertex + i, stride_dwords, x[i],
+                      y[i]);
+    if (!std::isfinite(x[i]) || !std::isfinite(y[i])) {
+      return false;
+    }
+  }
+  // A rectangle list rectangle is given by 3 of its corners: exactly two
+  // distinct x values and two distinct y values.
+  auto distinct = [](const float* v) {
+    return (v[0] != v[1]) + (v[0] != v[2] && v[1] != v[2]) + 1;
+  };
+  return distinct(x) == 2 && distinct(y) == 2;
+}
+}  // namespace
+
+void SetResolveRectangle(const ResolveRectangle& rectangle) {
+  current_resolve_rectangle = rectangle;
+}
+
+const ResolveRectangle& GetResolveRectangle() {
+  return current_resolve_rectangle;
+}
+
+uint32_t GetResolveRectangleLayout(const RegisterFile& regs,
+                                   const Memory& memory,
+                                   xenos::PrimitiveType primitive_type,
+                                   uint32_t vertex_count,
+                                   ResolveRectangle& layout_out) {
+  layout_out = ResolveRectangle();
+  const bool rectangle_list =
+      primitive_type == xenos::PrimitiveType::kRectangleList &&
+      vertex_count >= 3;
+  const uint32_t rectangle_count = rectangle_list ? vertex_count / 3 : 1;
+  const uint32_t vertices = rectangle_count * 3;
+
+  for (uint32_t fetch_index = 0; fetch_index < 96; ++fetch_index) {
+    xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(fetch_index);
+    if (fetch.type != xenos::FetchConstantType::kVertex || fetch.size < 6) {
+      continue;
+    }
+    // Stay inside the 512 MB of physical memory.
+    if ((uint64_t(fetch.address) + fetch.size) * sizeof(uint32_t) >
+        0x20000000) {
+      continue;
+    }
+    // Exact fits first, then the smallest strides.
+    const uint32_t fit = fetch.size % vertices ? 0 : fetch.size / vertices;
+    uint32_t candidates[] = {fit, 2, 3, 4, fetch.size / vertices};
+    for (uint32_t stride : candidates) {
+      if (stride < 2 || stride > 16 ||
+          uint64_t(vertices - 1) * stride + 2 > fetch.size) {
+        continue;
+      }
+      bool all_valid = true;
+      for (uint32_t r = 0; r < rectangle_count && all_valid; ++r) {
+        all_valid =
+            IsAxisAlignedResolveRectangle(memory, fetch, r * 3, stride);
+      }
+      if (!all_valid) {
+        continue;
+      }
+      layout_out.fetch_index = fetch_index;
+      layout_out.stride_dwords = stride;
+      if (fetch_index != 0 || rectangle_count > 1 || fetch.size != 6) {
+        static uint32_t logged_count = 0;
+        if (logged_count < 16) {
+          ++logged_count;
+          XELOGW(
+              "Resolve draw: {} rectangle(s) from vertex fetch {}, stride {} "
+              "dwords, buffer {} dwords",
+              rectangle_count, fetch_index, stride, uint32_t(fetch.size));
+        }
+      }
+      return rectangle_count;
+    }
+  }
+
+  static uint32_t logged_fallback = 0;
+  if (logged_fallback < 4) {
+    ++logged_fallback;
+    xenos::xe_gpu_vertex_fetch_t fetch0 = regs.GetVertexFetch(0);
+    XELOGW(
+        "Resolve draw with {} vertices: no vertex fetch constant holds a "
+        "rectangle layout (fetch 0: type {}, {} dwords)",
+        vertex_count, uint32_t(fetch0.type), uint32_t(fetch0.size));
+  }
+  return 1;
+}
+
 XE_MSVC_OPTIMIZE_SMALL()
 bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
                     TraceWriter& trace_writer, uint32_t draw_resolution_scale_x,
@@ -1267,16 +1378,29 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
   // Get the extent of pixels covered by the resolve rectangle, according to the
   // top-left rasterization rule.
   // D3D9 HACK: Vertices to use are always in vf0, and are written by the CPU.
-  xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
-  if (fetch.type != xenos::FetchConstantType::kVertex || fetch.size != 3 * 2) {
+  // Rectangle lists with more than one rectangle are resolved one rectangle at
+  // a time, selected with SetResolveRectangle.
+  const ResolveRectangle& rectangle = GetResolveRectangle();
+  xenos::xe_gpu_vertex_fetch_t fetch =
+      regs.GetVertexFetch(rectangle.fetch_index);
+  if (fetch.type != xenos::FetchConstantType::kVertex ||
+      uint64_t(rectangle.first_vertex + 2) * rectangle.stride_dwords + 2 >
+          fetch.size) {
     XELOGE("Unsupported resolve vertex buffer format");
     assert_always();
     return false;
   }
   trace_writer.WriteMemoryRead(fetch.address * sizeof(uint32_t),
                                fetch.size * sizeof(uint32_t));
-  const float* vertices_guest = reinterpret_cast<const float*>(
-      memory.TranslatePhysical(fetch.address * sizeof(uint32_t)));
+  float vertices_guest[6];
+  for (uint32_t i = 0; i < 3; ++i) {
+    // Read already swapped; the loop below swaps, so swap back here.
+    float x, y;
+    ReadResolveVertex(memory, fetch, rectangle.first_vertex + i,
+                      rectangle.stride_dwords, x, y);
+    vertices_guest[i * 2] = xenos::GpuSwap(x, fetch.endian);
+    vertices_guest[i * 2 + 1] = xenos::GpuSwap(y, fetch.endian);
+  }
   // Most vertices have a negative half-pixel offset applied, which we reverse.
   float half_pixel_offset =
       regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero

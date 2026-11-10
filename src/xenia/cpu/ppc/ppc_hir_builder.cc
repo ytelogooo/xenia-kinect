@@ -200,6 +200,19 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
 }
 
 void PPCHIRBuilder::MaybeBreakOnInstruction(uint32_t address) {
+  if (Function* hook = frontend_->GetGuestHookFunction(address)) {
+    Comment("guest hook");
+    ContextBarrier();
+    CallExtern(hook);
+  }
+  if (!builtins()->probes.empty()) {
+    auto it = builtins()->probes.find(address);
+    if (it != builtins()->probes.end()) {
+      Comment("--probe_guest_addresses target");
+      ContextBarrier();
+      CallExtern(it->second);
+    }
+  }
   if (address != cvars::break_on_instruction) {
     return;
   }

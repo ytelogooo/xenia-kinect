@@ -23,6 +23,7 @@
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
+#include "xenia/vfs/devices/host_path_entry.h"
 #include "xenia/vfs/devices/stfs_xbox.h"
 #include "xenia/xbox.h"
 
@@ -488,8 +489,54 @@ dword_result_t XamContentOpenFile_entry(
     dword_t user_index, lpstring_t root_name, lpstring_t path, dword_t flags,
     lpdword_t disposition_ptr, lpdword_t license_mask_ptr,
     pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  // Mounts an XContent package file (STFS/SVOD) found at a guest path under
+  // |root_name|. Kinect titles use this before NuiInitialize to mount
+  // game:\Database.xmplr as "stexemplar" and game:\NuiIdentity.bin.be as
+  // "nuiidentity"; if both fail the NUI runtime is never started.
   // TODO(gibbed): arguments assumed based on XamContentCreate.
-  return X_ERROR_FILE_NOT_FOUND;
+  const std::string guest_path(path ? path.value() : std::string_view());
+  const std::string name(root_name ? root_name.value() : std::string_view());
+
+  X_RESULT result = X_ERROR_FILE_NOT_FOUND;
+  vfs::Entry* entry = kernel_state()->file_system()->ResolvePath(guest_path);
+  auto* host_entry = dynamic_cast<vfs::HostPathEntry*>(entry);
+  if (!entry) {
+    result = X_ERROR_FILE_NOT_FOUND;
+  } else if (!host_entry) {
+    // TODO: packages inside disc images/containers are not supported yet.
+    XELOGW("XamContentOpenFile: '{}' is not a host file; extract the game "
+           "to a folder to use it",
+           guest_path);
+    result = X_ERROR_FILE_NOT_FOUND;
+  } else if (kernel_state()->content_manager()->IsContentOpen(name)) {
+    result = X_ERROR_ALREADY_EXISTS;
+  } else if (kernel_state()->content_manager()->OpenAndMountPackage(
+                 host_entry->host_path(), name)) {
+    result = X_ERROR_SUCCESS;
+  } else {
+    result = X_ERROR_FUNCTION_FAILED;
+  }
+
+  XELOGI("XamContentOpenFile({:02X}, '{}', '{}', {:08X}) -> {:08X}",
+         user_index.value(), name, guest_path, flags.value(), result);
+
+  if (disposition_ptr) {
+    *disposition_ptr = XSUCCEEDED(result)
+                           ? static_cast<uint32_t>(kDispositionState::Open)
+                           : 0;
+  }
+  if (license_mask_ptr && XSUCCEEDED(result)) {
+    *license_mask_ptr = 0;
+  }
+
+  if (overlapped_ptr) {
+    kernel_state()->CompleteOverlappedImmediateEx(
+        overlapped_ptr, result, X_HRESULT_FROM_WIN32(result),
+        XSUCCEEDED(result) ? static_cast<uint32_t>(kDispositionState::Open)
+                           : 0);
+    return X_ERROR_IO_PENDING;
+  }
+  return result;
 }
 DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kStub);
 
@@ -952,6 +999,64 @@ dword_result_t XamContentGetDeviceVolumePath_entry(dword_t device_id,
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamContentGetDeviceVolumePath, kContent, kStub);
+
+// XamCache* keep files on the system cache partitions, each described by a
+// block the title owns. The id and key name the file for some cache types. No
+// cache partition is mounted here. A lookup finds nothing and a create has no
+// partition to make the file on.
+struct X_XAM_CACHE_FILE {
+  xe::be<uint32_t> flags;
+  xe::be<uint32_t> type;
+  xe::be<uint32_t> id;
+  xe::be<uint32_t> unused_C;
+  xe::be<uint64_t> key;
+  // Given for a create, found by an open.
+  xe::be<uint64_t> version;
+  xe::be<uint32_t> size;
+  xe::be<uint32_t> handle;
+  char path[0x10C];
+  // Links the open file into the cache's list.
+  uint8_t internal[0x114];
+};
+static_assert_size(X_XAM_CACHE_FILE, 0x248);
+
+constexpr uint32_t kCacheFileFlagCreate = 0x1;
+// A title's files are closed when it ends.
+constexpr uint32_t kCacheFileFlagTitle = 0x4000;
+
+dword_result_t XamCacheOpenFile_entry(pointer_t<X_XAM_CACHE_FILE> file) {
+  if (!file) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  file->flags = file->flags | kCacheFileFlagTitle;
+  const bool create = file->flags & kCacheFileFlagCreate;
+  if (!create) {
+    file->size = 0;
+    file->version = 0;
+  }
+  file->path[0] = 0;
+  file->handle = 0xFFFFFFFF;
+  // ERROR_INVALID_DRIVE for a create.
+  return create ? X_RESULT_FROM_WIN32(0x0000000FL) : X_ERROR_FILE_NOT_FOUND;
+}
+DECLARE_XAM_EXPORT1(XamCacheOpenFile, kContent, kStub);
+
+// Returns TRUE once the files of cache_type, or of every type for 0, are
+// deleted. There are none here.
+dword_result_t XamCacheReset_entry(dword_t cache_type) { return 1; }
+DECLARE_XAM_EXPORT1(XamCacheReset, kContent, kStub);
+
+// XamXlfs* run the queue that uploads files to Xbox LIVE file storage. Xenia
+// has no upload queue. Starting one fails whether or not a profile is signed in
+// to LIVE. Callers carry on without it. The first argument is unused.
+dword_result_t XamXlfsInitializeUploadQueue_entry(dword_t unused,
+                                                  lpdword_t queue_handle_ptr) {
+  if (queue_handle_ptr) {
+    *queue_handle_ptr = 0;
+  }
+  return X_E_FAIL;
+}
+DECLARE_XAM_EXPORT1(XamXlfsInitializeUploadQueue, kContent, kStub);
 
 dword_result_t XamContentGetMetaDataInternal_entry(
     pointer_t<XCONTENT_DATA_INTERNAL> content_data_ptr,

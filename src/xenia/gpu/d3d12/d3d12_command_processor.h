@@ -327,8 +327,40 @@ class D3D12CommandProcessor final : public CommandProcessor {
                  bool major_mode_explicit) override;
 
   bool IssueCopy() override;
+  // Copy-mode rectangle lists, through
+  // D3D12RenderTargetCache::ResolveRectangles where possible.
+  bool IssueCopyRectanglesBatched(xenos::PrimitiveType primitive_type,
+                                  uint32_t vertex_count);
   XE_NOINLINE
   bool IssueCopy_ReadbackResolvePath();
+  // d3d12_gpu_timing: a timestamp (index, UINT32_MAX if not taken), a span
+  // from a timestamp to now, and reading them around the memexport waits.
+  uint32_t GpuTimestamp();
+  void GpuTimingSpan(uint32_t category, uint32_t begin);
+  void GpuTimingBeforeWait();
+  void GpuTimingAfterWait(bool awaited);
+  // Copies a resolved range back to guest memory (readback_resolve).
+  bool ReadbackResolvedRange(uint32_t written_address, uint32_t written_length,
+                             const reg::RB_COPY_DEST_INFO& copy_dest_info,
+                             bool is_scaled);
+  // ReadbackResolvedRange in two steps, so several ranges can share one GPU
+  // wait: recording the copy (false if there's nothing to read back), then
+  // waiting if any needs it and copying to guest memory.
+  struct PendingResolveReadback {
+    ID3D12Resource* source;
+    // source's persistent mapping, or null to map it for the copy.
+    const void* mapping;
+    uint32_t address;
+    uint32_t length;
+    bool wait;
+  };
+  bool PrepareResolveReadback(uint32_t written_address,
+                              uint32_t written_length,
+                              const reg::RB_COPY_DEST_INFO& copy_dest_info,
+                              bool is_scaled,
+                              PendingResolveReadback& pending_out);
+  void FinishResolveReadbacks(const PendingResolveReadback* pending,
+                              size_t count);
   void InitializeTrace() override;
 
  private:
@@ -783,11 +815,28 @@ class D3D12CommandProcessor final : public CommandProcessor {
   struct ReadbackBuffer {
     ID3D12Resource* buffers[2] = {nullptr, nullptr};
     uint32_t sizes[2] = {0, 0};
+    // Persistent mappings of the buffers (null if mapping failed).
+    void* mappings[2] = {nullptr, nullptr};
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
+    void Release(uint32_t index) {
+      if (buffers[index]) {
+        if (mappings[index]) {
+          D3D12_RANGE written_range = {};
+          buffers[index]->Unmap(0, &written_range);
+        }
+        buffers[index]->Release();
+      }
+      buffers[index] = nullptr;
+      mappings[index] = nullptr;
+      sizes[index] = 0;
+    }
   };
   // Map: (written_address << 32 | written_length) -> ReadbackBuffer
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
+  // Ranges written by D3D12RenderTargetCache::ResolveRectangles.
+  std::vector<std::pair<uint32_t, uint32_t>> batched_resolve_ranges_;
+  std::vector<PendingResolveReadback> batched_readbacks_;
 
   // Simple single buffer for memexport (always syncs, no double-buffering)
   ID3D12Resource* memexport_readback_buffer_ = nullptr;

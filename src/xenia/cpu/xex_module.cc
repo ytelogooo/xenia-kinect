@@ -13,6 +13,7 @@
 
 #include "xenia/base/byte_order.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/memory.h"
@@ -46,6 +47,12 @@ DEFINE_bool(
     "we've recognized as being functions via simple heuristics, good for error "
     "finding/stress testing with the JIT",
     "CPU");
+
+DEFINE_bool(dump_xex_image, false,
+            "Write each loaded title module's decrypted image to "
+            "<module>_image.bin in the working directory, for offline "
+            "disassembly.",
+            "CPU");
 
 DECLARE_bool(allow_plugins);
 
@@ -1055,6 +1062,21 @@ bool XexModule::LoadContinue() {
   if (ReadPEHeaders()) {
     XELOGE("Failed to load XEX PE headers!");
     return false;
+  }
+
+  if (cvars::dump_xex_image) {
+    const uint32_t size = image_size();
+    std::filesystem::path dump_path =
+        std::filesystem::path(name_).stem().string() + "_image.bin";
+    if (FILE* f = xe::filesystem::OpenFile(dump_path, "wb")) {
+      fwrite(memory()->TranslateVirtual(base_address_), 1, size, f);
+      fclose(f);
+      XELOGI("Dumped XEX image '{}': base {:08X}, size {:08X} -> {}", name_,
+             base_address_, size, xe::path_to_utf8(dump_path));
+    } else {
+      XELOGE("Failed to open {} for XEX image dump",
+             xe::path_to_utf8(dump_path));
+    }
   }
 
   // Parse any "unsafe" headers into safer variants

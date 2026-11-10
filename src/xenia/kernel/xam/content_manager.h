@@ -135,6 +135,11 @@ class ContentManager {
 
   bool UpdateSpaData(vfs::Entry* spa_file_update);
 
+  // True when the title still has a file open inside the package's device.
+  bool HasOpenFilesInPackage(const ContentPackage& package) const;
+  // Frees detached packages whose files the title has closed in the meantime.
+  void ReleaseUnusedDetachedPackages();
+
   uint32_t content_device_id_ = 0;
 
   KernelState* kernel_state_;
@@ -144,6 +149,9 @@ class ContentManager {
   xe::global_critical_region global_critical_region_;
   std::unordered_map<std::string, std::unique_ptr<ContentPackage>>
       mounted_packages_;
+  // DLC packages the title closed while it still had files open in them. They
+  // stay alive (without a root name) until those files are closed.
+  std::vector<std::unique_ptr<ContentPackage>> detached_packages_;
 };
 
 }  // namespace xam

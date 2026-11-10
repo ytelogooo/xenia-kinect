@@ -2426,7 +2426,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       OnVIZSurveyDraw(false);
       return true;
     }
-    return IssueCopy();
+    return IssueCopyRectangles(prim_type, index_count);
   }
 
   if (regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0) {

@@ -9,6 +9,8 @@
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_video.h"
 
+#include <atomic>
+
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/graphics_system.h"
@@ -463,6 +465,10 @@ dword_result_t VdRetrainEDRAM_entry(unknown_t unk0, unknown_t unk1,
 }
 DECLARE_XBOXKRNL_EXPORT1(VdRetrainEDRAM, kVideo, kStub);
 
+std::atomic<uint64_t> vd_swap_count{0};
+
+uint64_t GetVdSwapCount() { return vd_swap_count.load(); }
+
 void VdSwap_entry(
     lpvoid_t buffer_ptr,        // ptr into primary ringbuffer
     lpvoid_t fetch_ptr,         // frontbuffer Direct3D 9 texture header fetch
@@ -472,6 +478,8 @@ void VdSwap_entry(
     lpdword_t frontbuffer_ptr,  // ptr to frontbuffer address
     lpdword_t texture_format_ptr, lpdword_t color_space_ptr, lpdword_t width,
     lpdword_t height) {
+  vd_swap_count.fetch_add(1, std::memory_order_relaxed);
+
   // All of these parameters are REQUIRED.
   assert(buffer_ptr);
   assert(fetch_ptr);
