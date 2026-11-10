@@ -1,0 +1,81 @@
+name: Kinect test build
+
+# Builds the kinect branch for Windows on every push (or by hand from the
+# Actions tab) and publishes it as the "kinect-latest" pre-release: a zip with
+# xenia_canary.exe, the drag-and-drop launchers and the bridge tools.
+
+on:
+  push:
+    branches: [kinect]
+    paths-ignore:
+      - 'docs/**'
+  workflow_dispatch:
+
+concurrency:
+  group: kinect-test-build
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Windows (x86-64)
+    uses: ./.github/workflows/Windows_x86.yml
+
+  publish:
+    name: Publish kinect-latest
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Download the Windows build
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Package
+        run: |-
+          set -euo pipefail
+          mkdir -p pkg/tools
+          7z x -opkg artifacts/xenia_canary_windows.7z
+          test -f pkg/xenia_canary.exe
+          cp tools/kinect_launchers/*.bat pkg/
+          cp -r tools/kinect_sdk_bridge pkg/tools/
+          mkdir -p pkg/tools/kinect_bridge
+          cp tools/kinect_bridge/kinect_bridge.py \
+             tools/kinect_bridge/requirements.txt \
+             tools/kinect_bridge/README.md pkg/tools/kinect_bridge/
+          cp README.md pkg/README.md
+          # Windows line endings for the launchers and scripts.
+          sed -i 's/\r*$/\r/' pkg/*.bat pkg/tools/kinect_sdk_bridge/build.ps1
+          (cd pkg && zip -r -9 ../xenia-kinect-windows.zip .)
+
+      - name: Publish the pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |-
+          set -euo pipefail
+          SHORT="${GITHUB_SHA::7}"
+          {
+            echo "Automatic test build of the \`kinect\` branch at \`$SHORT\`:"
+            echo
+            git log -1 --format='%s' "$GITHUB_SHA"
+            echo
+            echo "Unzip it, then drag a game onto one of the **Play with ….bat**"
+            echo "launchers. Setup for each mode is in README.md (also on the"
+            echo "repository's front page)."
+          } > notes.md
+          # Replace the previous one, so the link always gives the newest build.
+          gh release delete kinect-latest --repo "$REPO" --cleanup-tag --yes \
+            2>/dev/null || true
+          gh release create kinect-latest \
+            --repo "$REPO" \
+            --target "$GITHUB_SHA" \
+            --title "Kinect test build ($SHORT)" \
+            --notes-file notes.md \
+            --prerelease \
+            xenia-kinect-windows.zip

@@ -55,6 +55,24 @@ DEFINE_bool(
     "GPU");
 
 DEFINE_bool(
+    readback_memexport_delayed, false,
+    "With readback_memexport, give the CPU what each memexporting draw wrote "
+    "one frame late (like readback_resolve = \"fast\" does for resolves) "
+    "instead of making it wait for the GPU to finish everything after every "
+    "such draw. Much faster for games that memexport every frame (the Kinect "
+    "NUI tracker), but they see results a frame old.",
+    "GPU");
+
+DEFINE_bool(
+    d3d12_early_submit, true,
+    "With readback_memexport, send the recorded GPU work to the GPU every 32 "
+    "draws (and right after each delayed memexport read-back), instead of "
+    "only when the CPU has to wait for it. The GPU then works while the rest "
+    "of the frame is recorded, so waits for memexport results are shorter. "
+    "Same results.",
+    "GPU");
+
+DEFINE_bool(
     d3d12_gpu_timing, false,
     "Measure with GPU timestamps how long the GPU spends on resolves and on "
     "memexport draws between the waits for memexport results, logged with "
@@ -82,6 +100,8 @@ struct ReadbackStats {
   Clock::time_point period_start = Clock::now();
   uint32_t frames = 0;
   uint32_t memexport_draws = 0;
+  // Of those, read back one frame late (readback_memexport_delayed).
+  uint32_t memexport_delayed = 0;
   uint64_t memexport_bytes = 0;
   uint32_t resolves = 0;
   uint64_t resolve_bytes = 0;
@@ -213,10 +233,11 @@ struct ReadbackStats {
     if (memexport_draws || resolves) {
       XELOGI(
           "GPU read-back: {:.1f} frames/s; per frame {:.1f} memexport draws "
-          "({:.0f} KB), {:.1f} resolves ({:.0f} KB), {:.1f} GPU waits (at most "
-          "{}) taking {:.1f} ms",
+          "({:.0f} KB, {:.1f} read a frame late), {:.1f} resolves ({:.0f} "
+          "KB), {:.1f} GPU waits (at most {}) taking {:.1f} ms",
           frames / seconds, double(memexport_draws) / std::max(frames, 1u),
           memexport_bytes / 1024.0 / std::max(frames, 1u),
+          double(memexport_delayed) / std::max(frames, 1u),
           double(resolves) / std::max(frames, 1u),
           resolve_bytes / 1024.0 / std::max(frames, 1u),
           double(waits) / std::max(frames, 1u), max_frame_waits,
@@ -1901,6 +1922,11 @@ void D3D12CommandProcessor::ShutdownContext() {
     pair.second.Release(0);
     pair.second.Release(1);
   }
+  for (auto& pair : memexport_delayed_buffers_) {
+    pair.second.Release(0);
+    pair.second.Release(1);
+  }
+  memexport_delayed_buffers_.clear();
   readback_buffers_.clear();
 
   ui::d3d12::util::ReleaseAndNull(memexport_readback_buffer_);
@@ -3269,13 +3295,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // the result.
   uint32_t memexport_total_size = 0;
   bool memexport_snapshot_taken = false;
+  // readback_memexport_delayed: this draw's buffer pair and the half written.
+  MemexportDelayedBuffer* memexport_delayed = nullptr;
+  uint32_t memexport_delayed_index = 0;
   if (memexport_used && GetGPUSetting(GPUSetting::ReadbackMemexport)) {
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
       memexport_total_size += memexport_range.size_bytes;
     }
     if (memexport_total_size != 0) {
-      ID3D12Resource* readback_buffer =
-          RequestReadbackBuffer(memexport_total_size * 2);
+      ID3D12Resource* readback_buffer = nullptr;
+      if (cvars::readback_memexport_delayed) {
+        memexport_delayed = RequestMemexportDelayedBuffer(
+            memexport_total_size * 2, memexport_delayed_index);
+        if (memexport_delayed) {
+          readback_buffer = memexport_delayed->buffers[memexport_delayed_index];
+        }
+      }
+      if (!readback_buffer) {
+        readback_buffer = RequestReadbackBuffer(memexport_total_size * 2);
+      }
       if (readback_buffer != nullptr) {
         shared_memory_->UseAsCopySource();
         SubmitBarriers();
@@ -3491,7 +3529,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     if (memexport_snapshot_taken) {
       // Read the exported data on the CPU.
       ID3D12Resource* readback_buffer =
-          RequestReadbackBuffer(memexport_total_size * 2);
+          memexport_delayed
+              ? memexport_delayed->buffers[memexport_delayed_index]
+              : RequestReadbackBuffer(memexport_total_size * 2);
       if (readback_buffer != nullptr) {
         shared_memory_->UseAsCopySource();
         SubmitBarriers();
@@ -3507,6 +3547,43 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         }
         ++readback_stats_.memexport_draws;
         readback_stats_.memexport_bytes += memexport_total_size;
+        if (memexport_delayed) {
+          // Hand the CPU what the same draw exported last frame, if that's
+          // there - waiting only if its submission is still running, which
+          // it rarely is - instead of awaiting this one.
+          memexport_delayed->submissions[memexport_delayed_index] =
+              GetCurrentSubmission();
+          memexport_delayed->totals[memexport_delayed_index] =
+              memexport_total_size;
+          const uint32_t previous = 1 - memexport_delayed_index;
+          const uint64_t previous_submission =
+              memexport_delayed->submissions[previous];
+          if (memexport_delayed->mappings[previous] &&
+              memexport_delayed->totals[previous] == memexport_total_size &&
+              previous_submission < GetCurrentSubmission()) {
+            if (previous_submission > GetCompletedSubmission()) {
+              const auto wait_start = ReadbackStats::Clock::now();
+              completion_timeline_->AwaitSubmissionAndUpdateCompleted(
+                  previous_submission);
+              readback_stats_.Wait(wait_start);
+              readback_stats_.memexport_wait_ms +=
+                  ReadbackStats::Ms(wait_start);
+            }
+            ApplyMemexportReadback(
+                static_cast<const uint8_t*>(
+                    memexport_delayed->mappings[previous]),
+                memexport_total_size);
+            ++readback_stats_.memexport_delayed;
+            if (cvars::d3d12_early_submit && submission_open_) {
+              // Start this copy now, so it's done when the next frame wants
+              // it rather than only after the next frame's swap.
+              EndSubmission(false);
+              early_submit_draws_ = 0;
+            }
+            return true;
+          }
+          // Nothing from last frame - this time, wait like without delaying.
+        }
         GpuTimingBeforeWait();
         const auto wait_start = ReadbackStats::Clock::now();
         const bool awaited = AwaitAllQueueOperationsCompletion();
@@ -3514,35 +3591,39 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         readback_stats_.memexport_wait_ms += ReadbackStats::Ms(wait_start);
         GpuTimingAfterWait(awaited);
         if (awaited) {
-          D3D12_RANGE readback_range;
-          readback_range.Begin = 0;
-          readback_range.End = memexport_total_size * 2;
-          void* readback_mapping;
-          if (SUCCEEDED(readback_buffer->Map(0, &readback_range,
-                                             &readback_mapping))) {
-            // Compared per byte as exports of 8 and 16 bit formats give
-            // ranges that aren't a multiple of 4 bytes.
-            const uint8_t* before_bytes =
-                reinterpret_cast<const uint8_t*>(readback_mapping);
-            const uint8_t* after_bytes = before_bytes + memexport_total_size;
-            for (const draw_util::MemExportRange& memexport_range :
-                 memexport_ranges_) {
-              uint8_t* guest_bytes = memory_->TranslatePhysical(
-                  memexport_range.base_address_dwords << 2);
-              for (uint32_t i = 0; i < memexport_range.size_bytes; ++i) {
-                if (after_bytes[i] != before_bytes[i]) {
-                  guest_bytes[i] = after_bytes[i];
-                }
-              }
-              before_bytes += memexport_range.size_bytes;
-              after_bytes += memexport_range.size_bytes;
+          if (memexport_delayed &&
+              memexport_delayed->mappings[memexport_delayed_index]) {
+            ApplyMemexportReadback(
+                static_cast<const uint8_t*>(
+                    memexport_delayed->mappings[memexport_delayed_index]),
+                memexport_total_size);
+          } else {
+            D3D12_RANGE readback_range;
+            readback_range.Begin = 0;
+            readback_range.End = memexport_total_size * 2;
+            void* readback_mapping;
+            if (SUCCEEDED(readback_buffer->Map(0, &readback_range,
+                                               &readback_mapping))) {
+              ApplyMemexportReadback(
+                  static_cast<const uint8_t*>(readback_mapping),
+                  memexport_total_size);
+              D3D12_RANGE readback_write_range = {};
+              readback_buffer->Unmap(0, &readback_write_range);
             }
-            D3D12_RANGE readback_write_range = {};
-            readback_buffer->Unmap(0, &readback_write_range);
           }
         }
       }
     }
+  }
+
+  // d3d12_early_submit: don't let more than 32 draws pile up unsubmitted
+  // while the title memexports, so the GPU is busy while the CPU records
+  // instead of only once the CPU waits for a memexport result.
+  if (cvars::d3d12_early_submit &&
+      GetGPUSetting(GPUSetting::ReadbackMemexport) &&
+      submission_open_ && ++early_submit_draws_ >= 32) {
+    EndSubmission(false);
+    early_submit_draws_ = 0;
   }
 
   return true;
@@ -3663,6 +3744,84 @@ void D3D12CommandProcessor::GpuTimingAfterWait(bool awaited) {
   gpu_timing_.count = 0;
   gpu_timing_.overflow = false;
   gpu_timing_.spans.clear();
+}
+
+void D3D12CommandProcessor::ApplyMemexportReadback(const uint8_t* readback,
+                                                   uint32_t total_size) {
+  // The first half is the snapshot before the draw, the second what the draw
+  // left - only the bytes the draw changed are written to guest memory.
+  // Compared per byte as exports of 8 and 16 bit formats give ranges that
+  // aren't a multiple of 4 bytes.
+  const uint8_t* before_bytes = readback;
+  const uint8_t* after_bytes = readback + total_size;
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    uint8_t* guest_bytes =
+        memory_->TranslatePhysical(memexport_range.base_address_dwords << 2);
+    for (uint32_t i = 0; i < memexport_range.size_bytes; ++i) {
+      if (after_bytes[i] != before_bytes[i]) {
+        guest_bytes[i] = after_bytes[i];
+      }
+    }
+    before_bytes += memexport_range.size_bytes;
+    after_bytes += memexport_range.size_bytes;
+  }
+}
+
+D3D12CommandProcessor::MemexportDelayedBuffer*
+D3D12CommandProcessor::RequestMemexportDelayedBuffer(uint32_t size,
+                                                     uint32_t& index_out) {
+  // Keyed by the exported ranges, which tell the draws apart.
+  uint64_t key = UINT64_C(0xCBF29CE484222325);
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    key = (key ^ memexport_range.base_address_dwords) *
+          UINT64_C(0x100000001B3);
+    key = (key ^ memexport_range.size_bytes) * UINT64_C(0x100000001B3);
+  }
+  if (memexport_delayed_buffers_.size() > 256 &&
+      !memexport_delayed_buffers_.count(key)) {
+    // A game exporting to ever-changing places - not for delaying.
+    return nullptr;
+  }
+  MemexportDelayedBuffer& buffer = memexport_delayed_buffers_[key];
+  buffer.last_used_frame = frame_current_;
+  const uint32_t index = buffer.current_index;
+  // If the same ranges are exported more than once a frame, the last export
+  // is what the next frame gets (copies on the queue are ordered), like
+  // readback_resolve = "fast" does with repeated resolves.
+  if (size > buffer.sizes[index]) {
+    if (buffer.submissions[index] > GetCompletedSubmission()) {
+      // The old buffer may still be written by the GPU.
+      return nullptr;
+    }
+    buffer.Release(index);
+    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(
+        buffer_desc, AlignReadbackBufferSize(size), D3D12_RESOURCE_FLAG_NONE);
+    ID3D12Resource* resource;
+    if (FAILED(provider.GetDevice()->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback,
+            provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&resource)))) {
+      return nullptr;
+    }
+    void* mapping;
+    D3D12_RANGE read_range;
+    read_range.Begin = 0;
+    read_range.End = buffer_desc.Width;
+    if (FAILED(resource->Map(0, &read_range, &mapping))) {
+      resource->Release();
+      return nullptr;
+    }
+    buffer.buffers[index] = resource;
+    buffer.mappings[index] = mapping;
+    buffer.sizes[index] = uint32_t(buffer_desc.Width);
+  }
+  // Not readable until this draw's copies are recorded.
+  buffer.totals[index] = 0;
+  index_out = index;
+  return &buffer;
 }
 
 bool D3D12CommandProcessor::IssueCopyRectanglesBatched(
@@ -4287,6 +4446,9 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
     // Swap all readback buffers for delayed sync (one frame behind)
     for (auto& pair : readback_buffers_) {
+      pair.second.current_index = 1 - pair.second.current_index;
+    }
+    for (auto& pair : memexport_delayed_buffers_) {
       pair.second.current_index = 1 - pair.second.current_index;
     }
 

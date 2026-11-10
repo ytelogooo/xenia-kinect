@@ -834,6 +834,38 @@ class D3D12CommandProcessor final : public CommandProcessor {
   };
   // Map: (written_address << 32 | written_length) -> ReadbackBuffer
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
+  // readback_memexport_delayed: per exported range set, two readback buffers
+  // (snapshot before the draw, then what it left), written in alternate
+  // frames, mapped for their whole life.
+  struct MemexportDelayedBuffer {
+    ID3D12Resource* buffers[2] = {nullptr, nullptr};
+    void* mappings[2] = {nullptr, nullptr};
+    uint32_t sizes[2] = {0, 0};
+    // Snapshot size of what's in each buffer (half its used size), 0 if not
+    // readable.
+    uint32_t totals[2] = {0, 0};
+    uint64_t submissions[2] = {0, 0};
+    uint32_t current_index = 0;
+    uint64_t last_used_frame = 0;
+    void Release(uint32_t index) {
+      if (buffers[index]) {
+        D3D12_RANGE written_range = {};
+        buffers[index]->Unmap(0, &written_range);
+        buffers[index]->Release();
+      }
+      buffers[index] = nullptr;
+      mappings[index] = nullptr;
+      sizes[index] = 0;
+      totals[index] = 0;
+    }
+  };
+  std::unordered_map<uint64_t, MemexportDelayedBuffer>
+      memexport_delayed_buffers_;
+  // d3d12_early_submit: draws recorded since the submission was last ended.
+  uint32_t early_submit_draws_ = 0;
+  MemexportDelayedBuffer* RequestMemexportDelayedBuffer(uint32_t size,
+                                                        uint32_t& index_out);
+  void ApplyMemexportReadback(const uint8_t* readback, uint32_t total_size);
   // Ranges written by D3D12RenderTargetCache::ResolveRectangles.
   std::vector<std::pair<uint32_t, uint32_t>> batched_resolve_ranges_;
   std::vector<PendingResolveReadback> batched_readbacks_;

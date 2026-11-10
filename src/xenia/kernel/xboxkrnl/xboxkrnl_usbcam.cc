@@ -132,11 +132,12 @@ DEFINE_int32(kinect_jd4_hand_flag, -1,
              "it (0 = treat both hands as reliable). -1 = leave it.",
              "Kernel");
 DEFINE_bool(kinect_jd4_skeleton_hands, true,
-            "Just Dance 4: give its skeleton filter the hands from the "
-            "skeleton frame, marked reliable, instead of its depth/colour "
-            "hand tracker's estimate (which Xenia's images make jumpy and "
-            "flag as unreliable, so the cursor crawled). On a console the "
-            "two match.",
+            "Just Dance 4 with a Kinect bridge: give its skeleton filter the "
+            "hands from the skeleton frame, marked reliable, instead of its "
+            "depth/colour hand tracker's estimate (which the bridges' images "
+            "make jumpy and flag as unreliable, so the cursor crawled). Not "
+            "used with a real Kinect (allow_kinect_camera), where the game's "
+            "own hand tracker works.",
             "Kernel");
 DEFINE_string(kinect_jd2014_colour_mapping, "nominal",
               "Just Dance 2014 crops the player's face for the player slot "
@@ -3107,6 +3108,13 @@ void Jd4FilterDebugHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
   dt_min = 1e9;
 }
 
+// kinect_jd4_skeleton_hands only applies to the bridges: with a real Kinect
+// the game's own hand tracker sees real images and works as on a console
+// (scoring felt better with it).
+bool Jd4SkeletonHands() {
+  return cvars::kinect_jd4_skeleton_hands && !cvars::allow_kinect_camera;
+}
+
 // kinect_jd4_hand_flag: at 8298D254 / 8298D2A4 (lwz r6, 0x1DC / 0x25C(r11),
 // r11 = player state), overwrite the flag in memory before it is read.
 void Jd4HandFlagHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
@@ -3128,7 +3136,7 @@ void Jd4HandFlagHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
     }
   }
   const uint32_t field = uint32_t(ctx->r[11]) + (expected & 0xFFFF);
-  if (cvars::kinect_jd4_skeleton_hands) {
+  if (Jd4SkeletonHands()) {
     // The tracker's position for this hand sits 0x5C bytes before its flag
     // (player + 0x180 / 0x200); r29 = skeleton slot, r3 = the skeleton frame
     // the filter reads the other joints from. Copy the frame's hand.
@@ -3365,7 +3373,7 @@ void InstallTitleWorkarounds() {
   if (cvars::kinect_debug_jd4_filter) {
     cpu::ppc::RegisterGuestHook(0x8298D2EC, Jd4FilterDebugHook);
   }
-  if (cvars::kinect_jd4_hand_flag >= 0 || cvars::kinect_jd4_skeleton_hands) {
+  if (cvars::kinect_jd4_hand_flag >= 0 || Jd4SkeletonHands()) {
     cpu::ppc::RegisterGuestHook(0x8298D254, Jd4HandFlagHook);
     cpu::ppc::RegisterGuestHook(0x8298D2A4, Jd4HandFlagHook);
   }

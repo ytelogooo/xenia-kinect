@@ -39,11 +39,12 @@ DEFINE_bool(kinect_id, true,
             "each frame. Off, these fail as before.",
             "HID");
 
-DEFINE_bool(kinect_system_tracking, true,
+DEFINE_bool(kinect_system_tracking, false,
             "With a real Kinect, answer Kinect titles' per-frame skeleton "
-            "message as the console's system does: it chooses which two "
-            "players they track. Kinect Adventures needs it for its title "
-            "screen cursor.",
+            "message as the console's system does when it chooses which two "
+            "players they track. Off: with it, Kinect Adventures stops "
+            "choosing players itself and loses them (its title screen cursor "
+            "needed guest object close procedures instead).",
             "HID");
 
 namespace xe {

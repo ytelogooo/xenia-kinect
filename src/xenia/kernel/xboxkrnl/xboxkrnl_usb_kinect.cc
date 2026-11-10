@@ -63,6 +63,18 @@ DEFINE_bool(kinect_usb_motor, true,
             "(titles' auto-tilt, the Kinect Tuner). Opened before the camera: "
             "borrowing it while the camera streams stops the camera.",
             "HID");
+DEFINE_bool(kinect_colour_gains, true,
+            "Real Kinect: apply the red, green and blue gains a title asks "
+            "for to the color frames. The Kinect already sets its own "
+            "exposure and white balance, so a title's gains come on top of "
+            "them; turn off if faces look too bright or too saturated.",
+            "HID");
+DEFINE_double(kinect_colour_gain_max, 8.0,
+              "Real Kinect: the most a title's color gains may brighten the "
+              "picture (1 to 8). A console also lengthens the exposure, "
+              "which Xenia can't, so high gains only brighten noise; lower "
+              "this if faces look blown out, raise it if they look dark.",
+              "HID");
 
 DEFINE_bool(kinect_usb_keep_no_depth, true,
             "Real Kinect: hand titles pixels without depth as the sensor sends "
@@ -216,7 +228,10 @@ struct ColorSettings {
   bool window = false;
   int32_t window_x = 0;
   int32_t window_y = 0;
+  // Applied to the frames (1 when kinect_colour_gains is off).
   float gains[3] = {1.0f, 1.0f, 1.0f};
+  // As the title asked for them.
+  float requested_gains[3] = {1.0f, 1.0f, 1.0f};
 };
 
 // The sensor's 8-bit Bayer (GRBG) color frame as the title asked for it:
@@ -1013,22 +1028,44 @@ class CameraDevice {
           settings.window_y = controls->window_y;
         }
         const uint32_t flags = controls->flags;
+        float requested_gains[3];
         for (uint32_t i = 0; i < 3; ++i) {
-          settings.gains[i] =
+          requested_gains[i] =
               flags & (2u << i)
                   ? std::clamp(float(uint32_t(controls->gains[i])) / 65536.0f,
                                0.0f, 8.0f)
-                  : previous.gains[i];
+                  : previous.requested_gains[i];
+          settings.requested_gains[i] = requested_gains[i];
+          settings.gains[i] =
+              cvars::kinect_colour_gains
+                  ? std::min(requested_gains[i],
+                             float(std::clamp(cvars::kinect_colour_gain_max,
+                                              1.0, 8.0)))
+                  : 1.0f;
         }
         {
           std::lock_guard<xe_mutex> lock(mutex_);
+          const bool gains_changed =
+              std::memcmp(settings.requested_gains,
+                          color_settings_.requested_gains,
+                          sizeof(settings.requested_gains)) != 0;
           if (settings.window != color_settings_.window ||
-              (settings.window && controls_logged_ < 60)) {
+              ((settings.window || gains_changed) && controls_logged_ < 60)) {
             ++controls_logged_;
-            XELOGI("Kinect: color window {} (at {}, {}), settings generation "
-                   "{}",
+            XELOGI("Kinect: color window {} (at {}, {}), flags {:08X}, gains "
+                   "{:.2f} {:.2f} {:.2f}{}, exposure {:.3f}, settings "
+                   "generation {}",
                    settings.window ? "on" : "off", settings.window_x,
-                   settings.window_y, uint32_t(requested_generation_));
+                   settings.window_y, flags, requested_gains[0],
+                   requested_gains[1], requested_gains[2],
+                   !cvars::kinect_colour_gains ? " (not applied)"
+                   : requested_gains[0] > cvars::kinect_colour_gain_max ||
+                           requested_gains[1] > cvars::kinect_colour_gain_max ||
+                           requested_gains[2] > cvars::kinect_colour_gain_max
+                       ? " (capped)"
+                       : "",
+                   float(uint32_t(controls->exposure_time)) / 65536.0f,
+                   uint32_t(requested_generation_));
           }
           color_settings_ = settings;
         }
