@@ -10,10 +10,18 @@
 #include "xenia/kernel/user_module.h"
 
 #include "xenia/base/byte_stream.h"
+#include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/xxhash.h"
 #include "xenia/cpu/elf_module.h"
 #include "xenia/emulator.h"
+
+DEFINE_path(dump_title_image, "",
+            "Diagnostic: write the title's loaded executable image (after "
+            "any title update is applied) to this file, to compare code "
+            "between versions.",
+            "Kernel");
 
 namespace xe {
 namespace kernel {
@@ -220,6 +228,18 @@ X_STATUS UserModule::LoadContinue() {
   // Finish XexModule load (PE sections/imports/symbols...)
   if (!xex_module()->LoadContinue()) {
     return X_STATUS_UNSUCCESSFUL;
+  }
+
+  if (!cvars::dump_title_image.empty() &&
+      !(xex_module()->xex_header()->module_flags & XEX_MODULE_DLL_MODULE)) {
+    const uint32_t base = xex_module()->base_address();
+    const uint32_t size = xex_module()->xex_security_info()->image_size;
+    if (FILE* file = xe::filesystem::OpenFile(cvars::dump_title_image, "wb")) {
+      std::fwrite(memory()->TranslateVirtual(base), 1, size, file);
+      std::fclose(file);
+      XELOGI("Wrote the title image ({:08X}, {:X} bytes) to {}", base, size,
+             xe::path_to_utf8(cvars::dump_title_image));
+    }
   }
 
   // Copy the xex2 header into guest memory.

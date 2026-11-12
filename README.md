@@ -89,7 +89,7 @@ Tested by the fork owner. "Bridge" means either bridge.
 |---|---|---|---|
 | Kinect Adventures! | ✅ Playable | — | 30 FPS with the GPU changes below; Kinect ID, avatar, tilt motor and floor work |
 | Just Dance 3 | ✅ Playable | ✅ | Player square, hand cursor, scoring |
-| Just Dance 4 | ✅ Playable | ✅ | DLC: only up to 14 packs show (known issue) |
+| Just Dance 4 | ✅ Playable | ✅ | More than 14 DLC packs need title update 1 (see below) |
 | Just Dance 2014 | ✅ Playable | ✅ Playable | Player faces in the player slots |
 | Just Dance 2015 | ✅ Playable | ✅ | Faces for up to two players; DLC |
 | Just Dance 2016 | ✅ Playable | ❓ | Face in the player square matches a console |
@@ -164,7 +164,10 @@ later), `[Display] show_fps` (frame rate in the window title).
 - Real Kinect mode: in Just Dance 4, 2014 and 2015 faces can look too bright
   or too saturated in a dim room; try `[HID] kinect_colour_gain_max = 2`
   (or `kinect_colour_gains = false`). More light helps most.
-- Just Dance 4: installing more than 14 DLC packs makes all of them disappear.
+- Just Dance 4: without its title update (TU1, media ID 1EA8B3A3), more than
+  14 DLC packs makes the game load only one of them — a bug in the game
+  itself, fixed by the update. Install the update with **File → Install
+  Content…**. All three ways to play work with and without the update.
 - Real Kinect mode is Windows only.
 
 ## Building

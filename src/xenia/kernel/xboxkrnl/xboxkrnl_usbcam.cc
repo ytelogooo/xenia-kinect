@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
@@ -37,6 +38,7 @@
 #include "xenia/kernel/xboxkrnl/kinect_tuner.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_usb_kinect.h"
 #include "xenia/kernel/xthread.h"
+#include "xenia/memory.h"
 #include "xenia/xbox.h"
 
 #ifdef XE_PLATFORM_WIN32
@@ -113,6 +115,11 @@ DEFINE_uint32(kinect_skeleton_interpolation_ms, 33,
 DEFINE_bool(kinect_debug_jd4_hand, false,
             "Diagnostic for Just Dance 4: log the right-hand position the "
             "game uses next to the one in the skeleton frame it received.",
+            "Kernel");
+DEFINE_bool(jd4_debug_print, false,
+            "Diagnostic for Just Dance 4: log the game's own debug messages "
+            "(its print function, 82211F20, is empty in the retail game), "
+            "e.g. the [DLC] package registration messages.",
             "Kernel");
 DEFINE_bool(kinect_debug_jd4_cursor, false,
             "Diagnostic for Just Dance 4: log the menu cursor object "
@@ -1763,6 +1770,9 @@ constexpr PlayerImageHook kKnownPlayerImageHooks[] = {
     // stream_obj = r30, frame at stream_obj+0x704, pitch at sp+0x50.
     {"Just Dance 4", 0x828853E0, 0x4BB232F5, {30, 0x70C, true},
      {30, 0x704, true}, {1, 0x50, true}, 0},
+    // The same code with title update 1 (0.0.1.2).
+    {"Just Dance 4 (title update 1)", 0x82885AD0, 0x4BB23085,
+     {30, 0x70C, true}, {30, 0x704, true}, {1, 0x50, true}, 0},
     // 825AF638 (stream object method): frame copied to r30 (0x28 bytes),
     // LockRect into sp+0x50 {Pitch, pBits}, memcpy into *(r25) of 4(r25)
     // bytes.
@@ -1770,7 +1780,7 @@ constexpr PlayerImageHook kKnownPlayerImageHooks[] = {
      {1, 0x50, true}, 0, {25, 4, true}},
 };
 
-std::atomic<int> player_image_hook_status[4];
+std::atomic<int> player_image_hook_status[std::size(kKnownPlayerImageHooks)];
 
 // kinect_debug_colour_texture: in the Just Dance 2014/2015 stream loop
 // (r31 = Kinect object, r30 = stream offset), the stream's engine texture
@@ -2365,12 +2375,15 @@ constexpr SkeletonHook kKnownSkeletonHooks[] = {
     {"Just Dance 2017 (NUI 2.0.21256)", 0x82B77234, 26, 0x4BFF5071},
     {"Dance Central 3", 0x82806A9C, 26, 0x4BFF8CA1},
     {"Just Dance 4 (NUI 2.0.21076)", 0x8267C13C, 26, 0x4BF9A6C1},
+    // The same code with title update 1 (0.0.1.2).
+    {"Just Dance 4 title update 1 (NUI 2.0.21076)", 0x8267C64C, 26,
+     0x4BF9A0E9},
     {"Just Dance 3 (NUI 2.0.20764)", 0x82D6EA24, 26, 0x4B70D131},
 };
 
 std::vector<SkeletonHook> active_skeleton_hooks;
 // Per hook: 0 = not checked yet, 1 = matches, 2 = does not match.
-std::atomic<int> skeleton_hook_status[8];
+std::atomic<int> skeleton_hook_status[std::size(kKnownSkeletonHooks)];
 
 void StoreVector(uint8_t* p, const Vec3& mm) {
   xe::store_and_swap<float>(p + 0x0, mm.x * 0.001f);
@@ -3116,11 +3129,24 @@ bool Jd4SkeletonHands() {
 }
 
 // kinect_jd4_hand_flag: at 8298D254 / 8298D2A4 (lwz r6, 0x1DC / 0x25C(r11),
-// r11 = player state), overwrite the flag in memory before it is read.
+// r11 = player state), overwrite the flag in memory before it is read. With
+// title update 1 the same code is at 8298D944 / 8298D994.
+constexpr uint32_t kJd4HandFlagSites[] = {0x8298D254, 0x8298D2A4, 0x8298D944,
+                                          0x8298D994};
 void Jd4HandFlagHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
-  const uint32_t expected = address == 0x8298D254 ? 0x80CB01DC : 0x80CB025C;
-  static std::atomic<int> status[2] = {0, 0};
-  std::atomic<int>& state = status[address == 0x8298D254 ? 0 : 1];
+  size_t site = 0;
+  while (site < std::size(kJd4HandFlagSites) &&
+         kJd4HandFlagSites[site] != address) {
+    ++site;
+  }
+  if (site == std::size(kJd4HandFlagSites)) {
+    return;
+  }
+  // Even sites are the left hand (flag at +0x1DC), odd ones the right.
+  const bool left = (site & 1) == 0;
+  const uint32_t expected = left ? 0x80CB01DC : 0x80CB025C;
+  static std::atomic<int> status[std::size(kJd4HandFlagSites)] = {};
+  std::atomic<int>& state = status[site];
   if (state == 2) {
     return;
   }
@@ -3143,7 +3169,7 @@ void Jd4HandFlagHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
     const uint32_t slot = uint32_t(ctx->r[29]);
     const uint32_t frame = uint32_t(ctx->r[3]);
     if (frame && slot < 6) {
-      const uint32_t joint = address == 0x8298D254 ? 7 : 11;
+      const uint32_t joint = left ? 7 : 11;
       std::memcpy(ctx->TranslateVirtual(field - 0x5C),
                   ctx->TranslateVirtual(frame + 0x30 + slot * 0x1C0 + 0x20 +
                                         joint * 0x10),
@@ -3364,6 +3390,126 @@ void JdColourMappingHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
   }
 }
 
+// jd4_debug_print: Just Dance 4's debug print (printf-style, format in r3,
+// arguments from r4) is a bare blr in the retail game; log the messages.
+// Only %s, %c and integer conversions are expanded (floats would be in the
+// FP registers).
+void Jd4DebugPrintHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
+  static std::atomic<int> state = 0;  // 0 unknown, 1 Just Dance 4, 2 not
+  if (state == 0) {
+    const uint32_t blr = xe::load_and_swap<uint32_t>(
+        ctx->TranslateVirtual(0x82211F20));
+    // addi r3, r11, 0x2B94 ("[DLC] MBF registration : %s") at 82A55C28.
+    const uint32_t check = xe::load_and_swap<uint32_t>(
+        ctx->TranslateVirtual(0x82A55C28));
+    state = blr == 0x4E800020 && check == 0x386B2B94 ? 1 : 2;
+    if (state == 1) {
+      XELOGI("Just Dance 4: logging the game's debug messages");
+    }
+  }
+  if (state != 1) {
+    return;
+  }
+  // Arguments aren't always what the format says (some callers pass other
+  // things), so only read guest memory that is actually readable.
+  const auto readable = [](uint32_t guest) {
+    if (guest < 0x10000) {
+      return false;
+    }
+    Memory* memory = kernel_state()->memory();
+    BaseHeap* heap = memory->LookupHeap(guest);
+    uint32_t protect = 0;
+    return heap && heap->QueryProtect(guest, &protect) &&
+           (protect & kMemoryProtectRead);
+  };
+  const auto guest_string = [ctx, &readable](uint32_t guest, size_t limit) {
+    std::string out;
+    if (!guest) {
+      return std::string("(null)");
+    }
+    if (!readable(guest)) {
+      return std::string("(bad pointer)");
+    }
+    const char* p = ctx->TranslateVirtual<const char*>(guest);
+    while (out.size() < limit) {
+      const uint32_t at = guest + uint32_t(out.size());
+      // Crossing into the next page: check that one too.
+      if ((at & 0xFFF) == 0 && at != guest && !readable(at)) {
+        break;
+      }
+      const char c = p[out.size()];
+      if (!c) {
+        break;
+      }
+      out.push_back(c);
+    }
+    return out;
+  };
+  const std::string format = guest_string(uint32_t(ctx->r[3]), 512);
+  std::string text;
+  uint32_t next_arg = 4;
+  const auto arg = [&]() -> uint32_t {
+    return next_arg <= 10 ? uint32_t(ctx->r[next_arg++]) : 0;
+  };
+  for (size_t i = 0; i < format.size(); ++i) {
+    if (format[i] != '%') {
+      text.push_back(format[i]);
+      continue;
+    }
+    size_t j = i + 1;
+    std::string spec = "%";
+    while (j < format.size() && std::strchr("-+ #0123456789.lhI", format[j])) {
+      if (format[j] != 'l' && format[j] != 'h' && format[j] != 'I') {
+        spec.push_back(format[j]);
+      }
+      ++j;
+    }
+    if (j >= format.size()) {
+      break;
+    }
+    const char conversion = format[j];
+    char buffer[64];
+    switch (conversion) {
+      case '%':
+        text.push_back('%');
+        break;
+      case 's':
+        text += guest_string(arg(), 256);
+        break;
+      case 'c':
+        text.push_back(char(arg()));
+        break;
+      case 'd':
+      case 'i':
+      case 'u':
+      case 'x':
+      case 'X':
+      case 'o':
+        spec.push_back(conversion);
+        std::snprintf(buffer, sizeof(buffer), spec.c_str(), arg());
+        text += buffer;
+        break;
+      case 'p':
+        std::snprintf(buffer, sizeof(buffer), "%08X", arg());
+        text += buffer;
+        break;
+      default:
+        text += "?";
+        break;
+    }
+    i = j;
+  }
+  while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
+    text.pop_back();
+  }
+  static std::atomic<uint32_t> logged = 0, dlc_logged = 0;
+  const bool dlc = text.find("[DLC]") != std::string::npos ||
+                   text.find("[BIGfile]") != std::string::npos;
+  if ((dlc ? dlc_logged : logged).fetch_add(1) < 4000) {
+    XELOGI("Just Dance 4 says: {}", text);
+  }
+}
+
 void InstallTitleWorkarounds() {
   cpu::ppc::RegisterGuestHook(0x82C516E0, Jd2014ColourMappingHook);
   cpu::ppc::RegisterGuestHook(0x82C51938, Jd2014ColourMappingHook);
@@ -3374,11 +3520,15 @@ void InstallTitleWorkarounds() {
     cpu::ppc::RegisterGuestHook(0x8298D2EC, Jd4FilterDebugHook);
   }
   if (cvars::kinect_jd4_hand_flag >= 0 || Jd4SkeletonHands()) {
-    cpu::ppc::RegisterGuestHook(0x8298D254, Jd4HandFlagHook);
-    cpu::ppc::RegisterGuestHook(0x8298D2A4, Jd4HandFlagHook);
+    for (uint32_t site : kJd4HandFlagSites) {
+      cpu::ppc::RegisterGuestHook(site, Jd4HandFlagHook);
+    }
   }
   if (cvars::kinect_debug_jd4_cursor) {
     cpu::ppc::RegisterGuestHook(0x82840ED0, Jd4CursorDebugHook);
+  }
+  if (cvars::jd4_debug_print) {
+    cpu::ppc::RegisterGuestHook(0x82211F20, Jd4DebugPrintHook);
   }
   if (cvars::kinect_debug_jd4_hand) {
     cpu::ppc::RegisterGuestHook(0x82835D28, Jd4HandDebugHook);
