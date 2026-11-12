@@ -110,7 +110,8 @@ the mode, what worked and your `xenia.log`.
   players, two full skeletons, real outlines and camera picture) or the
   webcam bridge.
 - **NUI system services:** Kinect ID (identity data, photos), the tilt and
-  floor exports, the Kinect microphone array (from a PC recording device),
+  floor exports, the Kinect microphone array (from a PC recording device,
+  with the game's own sound as the echo cancellation reference),
   Kinect Tuner dialog, avatars from the system avatar asset pack.
 - Per-game support for player images, faces and hand tracking in Just Dance
   2014–2017, Just Dance 3/4 and Dance Central 3.
@@ -150,7 +151,15 @@ Also useful: `[HID] kinect_usb_motor` (let games tilt the Kinect),
 measure), `[HID] kinect_colour_gains` (apply games' colour gains),
 `[HID] kinect_colour_gain_max` (limit them, 1–8),
 `[GPU] readback_memexport_delayed` (faster, tracking a frame
-later), `[Display] show_fps` (frame rate in the window title).
+later), `[Display] show_fps` (frame rate in the window title),
+`[Kernel] kinect_echo_reference` (let games remove their own sound from the
+microphones; on by default).
+
+**Recording a session (real Kinect):** `--kinect_record_path=<folder>`
+saves every depth and colour frame the game gets (about 22 MB a second).
+Play it back without standing in front of the Kinect with
+`--allow_kinect_camera=true --kinect_replay_path=<folder>` (it loops; no
+motor or microphones).
 
 ## Known issues
 
@@ -190,6 +199,8 @@ xb build --config=release
 - [dcwestra/xenia-edge](https://github.com/dcwestra/xenia-edge) (avatars,
   Harmonix song keys).
 - Backports by Tim Ryan (ryantimjohn) and Adrian.
+- [Kixenia](https://github.com/davicarlos/kixenia) by Davi Carlos: the
+  echo cancellation reference and Kinect recording / playback.
 - [libfreenect](https://github.com/OpenKinect/libfreenect) (the Kinect USB
   protocol and depth conversion), [libusb](https://libusb.info/),
   [UsbDk](https://github.com/daynix/UsbDk),

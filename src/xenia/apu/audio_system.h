@@ -10,8 +10,10 @@
 #ifndef XENIA_APU_AUDIO_SYSTEM_H_
 #define XENIA_APU_AUDIO_SYSTEM_H_
 
+#include <array>
 #include <atomic>
 
+#include "xenia/apu/audio_driver.h"
 #include "xenia/base/mutex.h"
 #include "xenia/base/threading.h"
 #include "xenia/cpu/processor.h"
@@ -48,6 +50,11 @@ class AudioSystem {
                           size_t* out_index);
   void UnregisterClient(size_t index);
   void SubmitFrame(size_t index, float* samples);
+  // XAudioCaptureRenderDriverFrame: the frame last played (every client's
+  // last submitted frame mixed, 6 channels of 256 big-endian floats), the
+  // reference a Kinect title's echo cancellation removes from the
+  // microphones.
+  void CaptureLastFrame(uint8_t* out);
 
   // Creates an independent, non-registered driver instance.
   virtual AudioDriver* CreateDriver(xe::threading::Semaphore* semaphore,
@@ -92,6 +99,8 @@ class AudioSystem {
     uint32_t wrapped_callback_arg;
     bool in_use;
     std::mutex lock;
+    std::array<uint8_t, AudioDriver::kFrameSizeMax> last_frame;
+    bool has_last_frame;
   } clients_[kMaximumClientCount];
 
   int FindFreeClient();

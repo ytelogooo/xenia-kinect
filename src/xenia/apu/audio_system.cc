@@ -9,6 +9,8 @@
 
 #include "xenia/apu/audio_system.h"
 
+#include <cstring>
+
 #include <limits>
 
 #include "xenia/apu/apu_flags.h"
@@ -266,6 +268,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg,
   clients_[index].callback_arg = callback_arg;
   clients_[index].wrapped_callback_arg = ptr;
   clients_[index].in_use = true;
+  clients_[index].has_last_frame = false;
 
   // Wake the worker so it re-scans and starts pacing this client immediately.
   pending_work_event_->Set();
@@ -302,7 +305,32 @@ void AudioSystem::SubmitFrame(size_t index, float* samples) {
     }
     return;
   }
+  // Kept for XAudioCaptureRenderDriverFrame (echo cancellation reference).
+  std::memcpy(clients_[index].last_frame.data(), samples,
+              AudioDriver::kFrameSizeMax);
+  clients_[index].has_last_frame = true;
   (clients_[index].driver)->SubmitFrame(samples);
+}
+
+// From Kixenia (Davi Carlos, github.com/davicarlos/kixenia): mix every
+// client's last frame as the played reference.
+void AudioSystem::CaptureLastFrame(uint8_t* out) {
+  std::array<float, AudioDriver::kFrameSamplesMax> mix = {};
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    for (size_t index = 0; index < kMaximumClientCount; ++index) {
+      if (!clients_[index].in_use || !clients_[index].has_last_frame) {
+        continue;
+      }
+      for (uint32_t i = 0; i < AudioDriver::kFrameSamplesMax; ++i) {
+        mix[i] += xe::load_and_swap<float>(clients_[index].last_frame.data() +
+                                           i * sizeof(float));
+      }
+    }
+  }
+  for (uint32_t i = 0; i < AudioDriver::kFrameSamplesMax; ++i) {
+    xe::store_and_swap<float>(out + i * sizeof(float), mix[i]);
+  }
 }
 
 void AudioSystem::UnregisterClient(size_t index) {
@@ -320,6 +348,7 @@ void AudioSystem::UnregisterClient(size_t index) {
   clients_[index].callback_arg = 0;
   clients_[index].wrapped_callback_arg = 0;
   clients_[index].in_use = false;
+  clients_[index].has_last_frame = false;
 
   // Drain the semaphore of its count.
   auto client_semaphore = client_semaphores_[index].get();

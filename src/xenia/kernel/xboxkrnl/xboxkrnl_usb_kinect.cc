@@ -52,6 +52,17 @@ DEFINE_bool(allow_kinect_camera, false,
             "used as before.",
             "HID");
 
+DEFINE_path(kinect_record_path, "",
+            "Real Kinect: record the depth and color frames the title gets "
+            "into this folder (about 22 MB a second), to play back later "
+            "with kinect_replay_path. From Kixenia (Davi Carlos).",
+            "HID");
+DEFINE_path(kinect_replay_path, "",
+            "With allow_kinect_camera: play a recording made with "
+            "kinect_record_path (looped, 30 frames a second) instead of a "
+            "real Kinect, so a title can be tried without standing in front "
+            "of one. No motor or microphones. From Kixenia (Davi Carlos).",
+            "HID");
 DEFINE_bool(kinect_use_usbdk, true,
             "Access a Kinect v1 camera through UsbDk, which borrows it from "
             "its Windows driver while the emulator runs. When disabled, the "
@@ -444,6 +455,17 @@ class CameraDevice {
  public:
   explicit CameraDevice(KernelState* kernel_state)
       : kernel_state_(kernel_state), memory_(kernel_state->memory()) {
+    if (!cvars::kinect_replay_path.empty()) {
+      camera_ = hid::kinect::UsbCamera::OpenRecording(
+          cvars::kinect_replay_path, [this]() { Notify(); });
+      if (!camera_) {
+        XELOGE("Kinect: no recording to play in {}",
+               xe::path_to_utf8(cvars::kinect_replay_path));
+        return;
+      }
+      StartWorker(kernel_state);
+      return;
+    }
     // The motor (tilt, LED, accelerometer) is a USB device of its own. It's
     // opened first: UsbDk taking it from the Kinect's Windows driver while the
     // camera streamed killed every camera transfer (and the IR projector).
@@ -496,6 +518,21 @@ class CameraDevice {
         motor_.reset();
       }
     }
+    if (!cvars::kinect_record_path.empty()) {
+      if (hid::kinect::WriteRecordingCalibration(cvars::kinect_record_path,
+                                                 camera_->calibration())) {
+        recording_ = true;
+        XELOGI("Kinect: recording the frames into {}",
+               xe::path_to_utf8(cvars::kinect_record_path));
+      } else {
+        XELOGE("Kinect: can't record into {}",
+               xe::path_to_utf8(cvars::kinect_record_path));
+      }
+    }
+    StartWorker(kernel_state);
+  }
+
+  void StartWorker(KernelState* kernel_state) {
     worker_thread_ = object_ref<XHostThread>(new XHostThread(
         kernel_state, kWorkerStackSize, 0,
         [this]() {
@@ -1227,6 +1264,19 @@ class CameraDevice {
         return true;
       }
       UnpackDepth(frame_, Guest<uint8_t>(buffer), frame_bytes / 2);
+      if (recording_) {
+        // Each depth frame the title gets, with the newest color frame.
+        camera_->CopyColorFrame(0, record_color_);
+        if (!hid::kinect::WriteRecordingFrame(cvars::kinect_record_path,
+                                              record_index_, frame_,
+                                              record_color_)) {
+          XELOGE("Kinect: recording stopped: can't write frame {}",
+                 record_index_);
+          recording_ = false;
+        } else {
+          ++record_index_;
+        }
+      }
       const int64_t now = SteadyMs();
       int64_t expected = 0;
       first_depth_ms_.compare_exchange_strong(expected, now);
@@ -1397,6 +1447,10 @@ class CameraDevice {
   // The window and gains of the latest camera settings request.
   ColorSettings color_settings_;
   std::vector<uint8_t> frame_;
+  // kinect_record_path.
+  bool recording_ = false;
+  uint32_t record_index_ = 0;
+  std::vector<uint8_t> record_color_;
   std::atomic<int64_t> first_depth_ms_{0};
   std::atomic<int64_t> last_depth_ms_{0};
   // Diagnostic counters.

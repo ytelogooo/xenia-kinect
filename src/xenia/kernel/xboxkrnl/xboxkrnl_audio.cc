@@ -10,12 +10,19 @@
 #include <cstring>
 
 #include "xenia/apu/audio_system.h"
+#include "xenia/base/cvar.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xam/kinect_microphones.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/xbox.h"
+
+DEFINE_bool(kinect_echo_reference, true,
+            "Give Kinect titles' echo cancellation the sound Xenia plays, so "
+            "they can remove it from what the microphones hear (game music "
+            "from speakers). Off: silence, nothing is removed.",
+            "Kernel");
 
 DECLARE_uint32(audio_flag);
 
@@ -145,11 +152,16 @@ DECLARE_XBOXKRNL_EXPORT2(XAudioGetRenderDriverTic, kAudio, kImplemented,
                          kHighFrequency);
 
 // The frame last played, which the title cancels from the microphones: 6
-// channels of 256 big-endian floats. Not kept here: silence, so the title
-// cancels nothing (headphones or a quiet room help).
+// channels of 256 big-endian floats (as in Kixenia, by Davi Carlos).
 dword_result_t XAudioCaptureRenderDriverFrame_entry(dword_t handle,
                                                     lpvoid_t buffer) {
-  if (buffer) {
+  if (!buffer) {
+    return X_ERROR_SUCCESS;
+  }
+  if (cvars::kinect_echo_reference) {
+    kernel_state()->emulator()->audio_system()->CaptureLastFrame(
+        buffer.as<uint8_t*>());
+  } else {
     std::memset(buffer.as<uint8_t*>(), 0, 6 * 256 * sizeof(float));
   }
   return X_ERROR_SUCCESS;

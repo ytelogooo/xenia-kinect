@@ -1,5 +1,6 @@
 add_library(xenia-hid-kinect STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/usb_camera.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/usb_camera_recording.cc
 )
 
 if(WIN32)

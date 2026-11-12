@@ -12,6 +12,7 @@
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -45,6 +46,13 @@ class UsbCamera {
   static std::unique_ptr<UsbCamera> Open(bool use_usbdk,
                                          std::function<void()> on_frame);
 
+  // Plays a recording (kinect_record_path) instead of a live camera, looping
+  // it at 30 fps, so a title's tracking can be tried without anyone in front
+  // of a sensor. Returns nullptr when the directory holds no recording.
+  // From Kixenia (Davi Carlos).
+  static std::unique_ptr<UsbCamera> OpenRecording(
+      const std::filesystem::path& directory, std::function<void()> on_frame);
+
   virtual const UsbCameraCalibration& calibration() const = 0;
 
   // Copies the newest complete frame if it is newer than `after`. Returns the
@@ -54,6 +62,15 @@ class UsbCamera {
   virtual uint32_t CopyColorFrame(uint32_t after,
                                   std::vector<uint8_t>& bayer) = 0;
 };
+
+// A recording directory holds calibration.bin and, for each frame N,
+// depth_NNNNN.bin (packed 11-bit depth) and color_NNNNN.bin (Bayer color).
+bool WriteRecordingCalibration(const std::filesystem::path& directory,
+                               const UsbCameraCalibration& calibration);
+bool WriteRecordingFrame(const std::filesystem::path& directory,
+                         uint32_t index,
+                         const std::vector<uint8_t>& packed_depth,
+                         const std::vector<uint8_t>& bayer);
 
 // The Kinect's motor device: the tilt motor (which tilts the sensor to an
 // angle relative to gravity, measured with its accelerometer), the LED and
