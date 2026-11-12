@@ -21,6 +21,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/ppc/ppc_emit.h"
@@ -110,6 +111,43 @@ void ProbeHandler(PPCContext* ppc_context, void* arg0, void* arg1) {
   {
     std::lock_guard<std::mutex> lock(probe_mutex);
     count = ++probe_counts[address];
+  }
+  static const std::vector<uint32_t> threads = [] {
+    std::vector<uint32_t> ids;
+    for (auto part : xe::utf8::split(cvars::probe_thread_ids, ",; ")) {
+      ids.push_back(
+          uint32_t(std::strtoul(std::string(part).c_str(), nullptr, 10)));
+    }
+    return ids;
+  }();
+  if (!threads.empty() &&
+      std::find(threads.begin(), threads.end(), ppc_context->thread_id) ==
+          threads.end()) {
+    return;
+  }
+  if (cvars::probe_log_limit) {
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1) >= cvars::probe_log_limit) {
+      return;
+    }
+    // A LARGE_INTEGER timeout or interval is usually on the stack.
+    auto stack_value = [&](uint64_t pointer) -> std::string {
+      const uint32_t p = uint32_t(pointer);
+      if (p < 0x70000000 || p >= 0x7F000000 || (p & 7)) {
+        return "-";
+      }
+      return fmt::format("{}", int64_t(xe::load_and_swap<uint64_t>(
+                                   ppc_context->TranslateVirtual(p))));
+    };
+    XELOGI(
+        "probe {:08X} hit #{} thread {}: r3={:08X} r4={:08X} r5={:08X} "
+        "r6={:08X} r7={:08X} r8={:08X} [r5]={} [r6]={} lr={:08X}",
+        address, count, ppc_context->thread_id, uint32_t(ppc_context->r[3]),
+        uint32_t(ppc_context->r[4]), uint32_t(ppc_context->r[5]),
+        uint32_t(ppc_context->r[6]), uint32_t(ppc_context->r[7]),
+        uint32_t(ppc_context->r[8]), stack_value(ppc_context->r[5]),
+        stack_value(ppc_context->r[6]), uint32_t(ppc_context->lr));
+    return;
   }
   if (count <= 5 || count % 300 == 0) {
     XELOGI("probe {:08X} hit #{}: r3={:08X} r4={:08X} r5={:08X} r6={:08X} "

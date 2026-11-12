@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/info/volume.h"
@@ -16,6 +17,8 @@
 #include "xenia/kernel/xfile.h"
 #include "xenia/vfs/device.h"
 #include "xenia/xbox.h"
+
+DECLARE_bool(trace_game_io);
 
 namespace xe {
 namespace kernel {
@@ -196,6 +199,16 @@ dword_result_t NtSetInformationFile_entry(
 
   X_STATUS result = X_STATUS_SUCCESS;
   uint32_t out_length;
+
+  if (cvars::trace_game_io) {
+    static std::atomic<uint32_t> traced{0};
+    if (traced.fetch_add(1) < 4000) {
+      XELOGI("NtSetInformationFile: handle={:08X} '{}' class {} value {:X}",
+             uint32_t(file_handle), file->entry()->name(), uint32_t(info_class),
+             info_length >= 8 ? xe::load_and_swap<uint64_t>(info_ptr.as<uint8_t*>())
+                              : 0);
+    }
+  }
 
   switch (info_class) {
     case XFileBasicInformation: {

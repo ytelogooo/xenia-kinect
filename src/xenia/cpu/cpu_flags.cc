@@ -61,6 +61,16 @@ DEFINE_string(probe_guest_addresses, "",
               "logged with r3-r6 and LR. Diagnostic only.",
               "CPU");
 
+DEFINE_string(probe_thread_ids, "",
+              "Only log --probe_guest_addresses hits on these guest thread IDs "
+              "(comma-separated; the 'thid' in XThread::Execute log lines; "
+              "empty = all threads).",
+              "CPU");
+DEFINE_uint32(probe_log_limit, 0,
+              "Log every --probe_guest_addresses hit, up to this many lines, "
+              "with r3-r8 and the 64-bit values r5 and r6 point at when they "
+              "point into a stack (0 = only the first hits and every 300th).",
+              "CPU");
 DEFINE_string(probe_dump, "",
               "ADDRESS:LENGTH (hex). Each logged --probe_guest_addresses hit "
               "also hex-dumps this much guest memory (at most 0x1000 bytes).",

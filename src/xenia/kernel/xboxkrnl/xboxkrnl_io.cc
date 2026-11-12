@@ -174,11 +174,13 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
                       head_len);
         }
         XELOGI(
-            "NtReadFile: handle={:08X} '{}' off={:X} len={:X} -> {:08X} "
-            "read={:X} data={:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}",
+            "NtReadFile: handle={:08X} '{}' off={:X} len={:X} buf={:08X} -> "
+            "{:08X} read={:X} data={:02X}{:02X}{:02X}{:02X} "
+            "{:02X}{:02X}{:02X}{:02X}",
             uint32_t(file_handle),
             file->entry() ? file->entry()->path() : std::string("?"),
-            read_offset, uint32_t(buffer_length), uint32_t(result), bytes_read,
+            read_offset, uint32_t(buffer_length), buffer.guest_address(),
+            uint32_t(result), bytes_read,
             head[0], head[1], head[2], head[3], head[4], head[5], head[6],
             head[7]);
       }
@@ -364,6 +366,30 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = static_cast<uint32_t>(bytes_written);
+      }
+
+      if (cvars::trace_game_io) {
+        static std::atomic<uint32_t> traced_writes{0};
+        if (traced_writes.fetch_add(1) < 4000) {
+          const uint8_t* data =
+              kernel_memory()->TranslateVirtual<const uint8_t*>(
+                  buffer.guest_address());
+          uint32_t nonzero = 0;
+          for (uint32_t i = 0; i < uint32_t(buffer_length); i += 64) {
+            nonzero += data[i] != 0;
+          }
+          XELOGI("NtWriteFile: handle={:08X} '{}' off={:X} len={:X} -> {:08X} "
+                 "written={:X} data={:02X}{:02X}{:02X}{:02X} ({} of {} "
+                 "sampled bytes non-zero)",
+                 uint32_t(file_handle), file->entry()->name(),
+                 byte_offset_ptr ? uint64_t(*byte_offset_ptr) : ~uint64_t(0),
+                 uint32_t(buffer_length), result, bytes_written,
+                 buffer_length > 0 ? data[0] : 0,
+                 buffer_length > 1 ? data[1] : 0,
+                 buffer_length > 2 ? data[2] : 0,
+                 buffer_length > 3 ? data[3] : 0, nonzero,
+                 (uint32_t(buffer_length) + 63) / 64);
+        }
       }
 
       // Queue the APC callback. It must be delivered via the APC mechanism even
@@ -897,6 +923,39 @@ void IoDeleteDevice_entry(pointer_t<X_DEVICE_OBJECT> device_ptr,
 }
 
 DECLARE_XBOXKRNL_EXPORT1(IoDeleteDevice, kFileSystem, kStub);
+
+// The utility drive code some titles carry (Kinect Sports, for its Show Off &
+// Share clips) dismounts the cache partition's volume and makes an STFS
+// device over it before using cache:. Here cache: is a host folder mounted
+// for every title and the partitions are NullDevices, so there is no volume
+// to dismount or make: report success and let the title go on to cache:.
+// StfsCreateDevice / StfsControlDevice as in Xenia Edge (Herman S.).
+dword_result_t IoDismountVolume_entry(lpvoid_t device_object) {
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolume, kFileSystem, kStub);
+
+dword_result_t IoDismountVolumeByFileHandle_entry(dword_t handle) {
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolumeByFileHandle, kFileSystem, kStub);
+
+dword_result_t StfsCreateDevice_entry(lpvoid_t params, dword_t params_size) {
+  if (params_size != 0x58) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(StfsCreateDevice, kFileSystem, kStub);
+
+dword_result_t StfsControlDevice_entry(lpvoid_t device, dword_t control_code,
+                                       lpvoid_t buffer) {
+  if (control_code > 4) {
+    return X_STATUS_INVALID_DEVICE_REQUEST;
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(StfsControlDevice, kFileSystem, kStub);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

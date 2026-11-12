@@ -36,5 +36,7 @@ DECLARE_bool(break_condition_truncate);
 DECLARE_bool(break_on_debugbreak);
 DECLARE_string(probe_guest_addresses);
 DECLARE_string(probe_dump);
+DECLARE_string(probe_thread_ids);
+DECLARE_uint32(probe_log_limit);
 
 #endif  // XENIA_CPU_CPU_FLAGS_H_

@@ -9,10 +9,15 @@
 
 #include "xenia/gpu/shared_memory.h"
 
+#include <atomic>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/bit_range.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
+
+DECLARE_uint32(debug_watch_physical_address);
 
 namespace xe {
 namespace gpu {
@@ -314,6 +319,16 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length,
   }
   length = std::min(length, kBufferSize - start);
   uint32_t last = start + length - 1;
+  if (cvars::debug_watch_physical_address &&
+      cvars::debug_watch_physical_address >= start &&
+      cvars::debug_watch_physical_address <= last) {
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1) < 4000) {
+      XELOGI("Watch {:08X}: GPU copy valid ({:08X}+{:X}, {})",
+             uint32_t(cvars::debug_watch_physical_address), start, length,
+             written_by_gpu ? "written by the GPU" : "uploaded");
+    }
+  }
   uint32_t valid_page_first = start >> page_size_log2_;
   uint32_t valid_page_last = last >> page_size_log2_;
   uint32_t valid_block_first = valid_page_first >> 6;
@@ -548,6 +563,16 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   }
   length = std::min(length, kBufferSize - physical_address_start);
   uint32_t physical_address_last = physical_address_start + (length - 1);
+  if (cvars::debug_watch_physical_address &&
+      cvars::debug_watch_physical_address >= physical_address_start &&
+      cvars::debug_watch_physical_address <= physical_address_last) {
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1) < 4000) {
+      XELOGI("Watch {:08X}: GPU copy invalidated ({:08X}+{:X})",
+             uint32_t(cvars::debug_watch_physical_address),
+             physical_address_start, length);
+    }
+  }
 
   uint32_t page_first = physical_address_start >> page_size_log2_;
   uint32_t page_last = physical_address_last >> page_size_log2_;

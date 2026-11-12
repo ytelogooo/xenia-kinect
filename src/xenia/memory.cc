@@ -9,6 +9,7 @@
 
 #include "xenia/memory.h"
 
+#include <atomic>
 #include <cstring>
 #include <random>
 
@@ -26,6 +27,10 @@
 // TODO(benvanik): move xbox.h out
 #include "xenia/xbox.h"
 
+DEFINE_uint32(debug_watch_physical_address, 0,
+              "Logs the write watches and invalidations of the GPU's copy of "
+              "the physical page holding this address (0 = off).",
+              "Memory");
 DEFINE_bool(protect_zero, true, "Protect the zero page from reads and writes.",
             "Memory");
 DEFINE_bool(emit_inline_mmio_checks, false,
@@ -2075,6 +2080,25 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address,
   system_page_last = std::min(system_page_last, system_page_count_ - 1);
   assert_true(system_page_first <= system_page_last);
 
+  if (cvars::debug_watch_physical_address && enable_invalidation_notifications) {
+    const uint32_t watched = cvars::debug_watch_physical_address;
+    if (watched >= physical_address && watched - physical_address < length) {
+      const uint32_t page =
+          (watched - physical_address_offset + host_address_offset()) >>
+          system_page_shift_;
+      static std::atomic<uint32_t> logged{0};
+      if (logged.fetch_add(1) < 4000) {
+        const xe::memory::PageAccess access = SystemPageGuestAccess(page);
+        XELOGI("Watch {:08X}: arming in heap {:08X}, guest access {}",
+               watched, heap_base_,
+               access == xe::memory::PageAccess::kNoAccess   ? "none"
+               : access == xe::memory::PageAccess::kReadOnly ? "read-only (no "
+                                                               "watch)"
+                                                             : "read-write");
+      }
+    }
+  }
+
   // Update callback flags for system pages and make their protection stricter
   // if needed.
   xe::memory::PageAccess protect_access =
@@ -2326,6 +2350,23 @@ bool PhysicalHeap::TriggerCallbacks(
     // violation surface.
     return SystemPageGuestAccess(system_page_first) ==
            xe::memory::PageAccess::kReadWrite;
+  }
+
+  if (cvars::debug_watch_physical_address) {
+    const uint32_t watched = cvars::debug_watch_physical_address;
+    const uint32_t start = GetPhysicalAddress(heap_base_) +
+                           (heap_relative_address & ~uint32_t(0xFFF));
+    if (watched >= start && watched - start < length + 0x1000) {
+      static std::atomic<uint32_t> logged{0};
+      if (logged.fetch_add(1) < 4000) {
+        XELOGI(
+            "Watch {:08X}: write watch fired in heap {:08X} ({:08X}+{:X}, "
+            "{}watched{})",
+            watched, heap_base_, virtual_address, length,
+            any_watched ? "" : "not ",
+            invalidate_unwatched ? ", invalidating anyway" : "");
+      }
+    }
   }
 
   // Trigger callbacks.

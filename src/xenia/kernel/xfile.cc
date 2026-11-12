@@ -179,9 +179,15 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address,
           }
           if (XSUCCEEDED(result)) {
             if (buffer_physical_heap) {
+              // The read is a known write, so invalidate also when no watch
+              // is armed (as for a guest protect-to-writable): a page that was
+              // read-only when last uploaded never got one, and the GPU would
+              // keep showing its old contents (Kinect Sports' Show Off &
+              // Share replays read each video frame from a file).
               buffer_physical_heap->TriggerCallbacks(
                   xe::global_critical_region::AcquireDirect(),
-                  buffer_guest_address, buffer_length, true, true);
+                  buffer_guest_address, buffer_length, true, true, true,
+                  true);
             }
 
             if (byte_offset) {

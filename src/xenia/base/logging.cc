@@ -10,6 +10,7 @@
 #include "xenia/base/logging.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -52,6 +53,9 @@ DEFINE_bool(log_to_debugprint, false, "Dump the log to DebugPrint.", "Logging");
 #endif  // XE_PLATFORM_ANDROID
 DEFINE_bool(flush_log, true, "Flush log file after each log line batch.",
             "Logging");
+DEFINE_bool(log_timestamps, false,
+            "Start each log line with the seconds since logging started.",
+            "Logging");
 
 DEFINE_uint32(log_mask, 0,
               "Disables specific categorizes for more granular debug logging. "
@@ -79,7 +83,11 @@ struct LogLine {
   uint16_t _pad_0;  // (2b) padding
   bool terminate;
   char prefix_char;
+  uint32_t time_ms;  // since logging started (log_timestamps)
 };
+
+const std::chrono::steady_clock::time_point log_start_time_ =
+    std::chrono::steady_clock::now();
 
 thread_local char thread_log_buffer_[64_KiB];
 
@@ -338,6 +346,13 @@ class Logger {
             fmt::format_to_n(prefix + 3, sizeof(prefix) - 3, "{:08X}",
                              line.thread_id);
             Write(prefix, sizeof(prefix) - 1);
+            if (cvars::log_timestamps) {
+              char time[24];
+              auto end = fmt::format_to_n(time, sizeof(time), "[{:6}.{:03}] ",
+                                          line.time_ms / 1000,
+                                          line.time_ms % 1000);
+              Write(time, end.size);
+            }
           }
 
           if (line.buffer_length) {
@@ -422,6 +437,10 @@ class Logger {
     line.thread_id = thread_id;
     line.prefix_char = prefix_char;
     line.terminate = terminate;
+    line.time_ms = uint32_t(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - log_start_time_)
+            .count());
 
     rb.Write(&line, sizeof(LogLine));
     if (buffer_length) {

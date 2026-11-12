@@ -318,7 +318,8 @@ DECLARE_XBOXKRNL_EXPORT1(XUsbcamGetState, kNone, kStub);
 //   0x1E expand packed 11-bit depth (+0x04 src, +0x08 0x67200, +0x0C dst,
 //        +0x10 -> u32 bytes produced, expected 0x96000)
 //   0x21 enable (+0x1C = 1)
-//   0x23 periodic measurement (async; +0x18 result). Left pending.
+//   0x23 colour settings (async): numbered at +0x18 on completion; colour
+//        frames carry the number at +0x2C.
 //
 // With kinect_connected set, an emulated sensor answers these and delivers
 // synthetic frames at 30 Hz; otherwise the camera is reported absent.
@@ -341,6 +342,7 @@ constexpr uint32_t kStatusCancelled = 0xC0000120;
 constexpr uint32_t kCamStateStreaming = 2;
 constexpr uint32_t kCamStateNeedsSetup = 4;
 constexpr uint32_t kStreamDepth = 4;
+constexpr uint32_t kStreamColour = 2;
 constexpr uint32_t kDepthWidth = 640;
 constexpr uint32_t kDepthHeight = 480;
 constexpr uint32_t kDepthBytes = kDepthWidth * kDepthHeight * 2;  // 0x96000
@@ -745,6 +747,26 @@ class SkeletonReceiver {
     std::memcpy(packet + 4, &version, 4);
     std::memcpy(packet + 8, &first, 4);
     std::memcpy(packet + 12, &second, 4);
+    return sendto(socket_, reinterpret_cast<const char*>(packet),
+                  int(sizeof(packet)), 0,
+                  reinterpret_cast<const sockaddr*>(&bridge_address_),
+                  int(sizeof(bridge_address_))) == int(sizeof(packet));
+  }
+
+  // Which camera picture the bridge should send: the whole view (whole =
+  // true; for titles that use the colour stream themselves) or its face crop
+  // (Just Dance's player images). XKCM v1: "XKCM", u32 version 1, u32 flags
+  // (1 = whole image). The bridge keeps a whole-image request for 3 s.
+  bool RequestColourImage(bool whole) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!have_bridge_address_) {
+      return false;
+    }
+    uint8_t packet[12];
+    std::memcpy(packet, "XKCM", 4);
+    const uint32_t version = 1, flags = whole ? 1 : 0;
+    std::memcpy(packet + 4, &version, 4);
+    std::memcpy(packet + 8, &flags, 4);
     return sendto(socket_, reinterpret_cast<const char*>(packet),
                   int(sizeof(packet)), 0,
                   reinterpret_cast<const sockaddr*>(&bridge_address_),
@@ -1264,6 +1286,112 @@ void DrawBodyFromJoints(std::vector<uint16_t>& depth,
   DrawSphere(depth, joints[3], 105);  // head
 }
 
+// The bridge crops its camera picture to the player's face for Just Dance.
+// A title reading the emulated colour stream wants the whole view instead
+// (Kinect Sports' Show Off & Share), so the colour stream asks the bridge for
+// it, unless a Just Dance face hook has used the picture in the last 3 s.
+std::atomic<int64_t> face_colour_used_ms{0};
+std::atomic<int64_t> colour_request_sent_ms{0};
+std::atomic<int> colour_request{-1};  // -1 none sent, 0 face crop, 1 whole
+
+int64_t SteadyMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// Called by the Just Dance hooks that show the bridge's face crop.
+void NoteFaceColourUse() {
+  face_colour_used_ms.store(SteadyMs(), std::memory_order_relaxed);
+  if (colour_request.load(std::memory_order_relaxed) == 1 &&
+      SkeletonReceiver::Get().RequestColourImage(false)) {
+    colour_request = 0;
+    XELOGI("NUI camera: asked the bridge for its face crop again");
+  }
+}
+
+// Called for each emulated colour frame.
+void RequestWholeColourIfUnused() {
+  const int64_t now = SteadyMs();
+  const int64_t face = face_colour_used_ms.load(std::memory_order_relaxed);
+  if (face && now - face < 3000) {
+    return;
+  }
+  if (colour_request.load(std::memory_order_relaxed) == 1 &&
+      now - colour_request_sent_ms.load(std::memory_order_relaxed) < 1000) {
+    return;
+  }
+  colour_request_sent_ms = now;
+  if (SkeletonReceiver::Get().RequestColourImage(true) &&
+      colour_request.exchange(1) != 1) {
+    XELOGI("NUI camera: asked the bridge for its whole camera picture");
+  }
+}
+
+// The emulated camera's colour stream (2): the bridge's camera picture in the
+// sensor's own formats, so the title's NUI runtime makes its colour frames
+// from it like from a real Kinect - every title gets a real picture (Kinect
+// Sports' Show Off & Share videos, photos), without a hook of its own. 8-bit
+// buffers (0x4B000) get Bayer GRBG, 16-bit ones (0x96000) YUV 4:2:2 (UYVY).
+// Returns the bytes written, 0 without a recent bridge picture.
+uint32_t WriteBridgeColourFrame(uint8_t* out, uint32_t size) {
+  constexpr uint32_t kWidth = 640, kHeight = 480;
+  constexpr uint32_t kBayerBytes = kWidth * kHeight;
+  constexpr uint32_t kYuvBytes = kWidth * kHeight * 2;
+  if (!cvars::kinect_live_colour || size < kBayerBytes) {
+    return 0;
+  }
+  RequestWholeColourIfUnused();
+  std::shared_ptr<const std::vector<uint8_t>> colour;
+  uint32_t colour_width, colour_height;
+  if (!SkeletonReceiver::Get().LatestColour(&colour, &colour_width,
+                                            &colour_height, 0.5) ||
+      !colour_width || !colour_height) {
+    return 0;
+  }
+  const bool mirror = cvars::kinect_live_colour_mirror;
+  const uint8_t* in = colour->data();
+  auto bgr_at = [&](uint32_t x, uint32_t y) {
+    uint32_t sx = x * colour_width / kWidth;
+    if (mirror) {
+      sx = colour_width - 1 - sx;
+    }
+    const uint32_t sy = y * colour_height / kHeight;
+    return in + (size_t(sy) * colour_width + sx) * 3;
+  };
+  if (size >= kYuvBytes) {
+    auto clamp8 = [](float v) {
+      return uint8_t(std::clamp(int(std::lround(v)), 0, 255));
+    };
+    for (uint32_t y = 0; y < kHeight; ++y) {
+      uint8_t* row = out + size_t(y) * kWidth * 2;
+      for (uint32_t x = 0; x < kWidth; x += 2) {
+        const uint8_t* p0 = bgr_at(x, y);
+        const uint8_t* p1 = bgr_at(x + 1, y);
+        const float y0 = 0.299f * p0[2] + 0.587f * p0[1] + 0.114f * p0[0];
+        const float y1 = 0.299f * p1[2] + 0.587f * p1[1] + 0.114f * p1[0];
+        const float r = (p0[2] + p1[2]) * 0.5f, g = (p0[1] + p1[1]) * 0.5f,
+                    b = (p0[0] + p1[0]) * 0.5f;
+        const float luma = 0.299f * r + 0.587f * g + 0.114f * b;
+        row[x * 2 + 0] = clamp8(128.0f + (b - luma) * 0.564f);
+        row[x * 2 + 1] = clamp8(y0);
+        row[x * 2 + 2] = clamp8(128.0f + (r - luma) * 0.713f);
+        row[x * 2 + 3] = clamp8(y1);
+      }
+    }
+    return kYuvBytes;
+  }
+  // GRBG: green where (x ^ y) is even, red on even rows, blue on odd ones.
+  for (uint32_t y = 0; y < kHeight; ++y) {
+    uint8_t* row = out + size_t(y) * kWidth;
+    for (uint32_t x = 0; x < kWidth; ++x) {
+      const uint8_t* bgr = bgr_at(x, y);
+      row[x] = !((x ^ y) & 1) ? bgr[1] : !(y & 1) ? bgr[2] : bgr[0];
+    }
+  }
+  return kBayerBytes;
+}
+
 class EmulatedNuiCamera {
  public:
   static EmulatedNuiCamera& Get() {
@@ -1344,8 +1472,28 @@ class EmulatedNuiCamera {
       case 0x1E:  // expand packed depth; never needed (frames are unpacked)
         return kStatusInvalidDeviceRequest;
 
-      case 0x23:  // periodic measurement: leave pending
-        return kStatusPending;
+      case 0x23: {
+        // Colour camera settings (window, gains, exposure; the real-Kinect
+        // path's kSetControls). The runtime numbers each settings change
+        // (+0x18, set on completion) and only takes colour frames that carry
+        // the current number (+0x2C of the read): left pending, every colour
+        // frame was thrown away (Kinect Sports recorded nothing for its Show
+        // Off & Share videos).
+        const uint8_t generation = ++colour_generation_;
+        xe::store_and_swap<uint32_t>(r + 0x18, generation);
+        const uint32_t callback = xe::load_and_swap<uint32_t>(r + 0x14);
+        if (callback && callback != 0xFFFFFFFF) {
+          uint64_t args[] = {req, kStatusSuccess, 0};
+          ctx->processor->Execute(ctx->thread_state, callback, args, 3);
+        }
+        static std::atomic<uint32_t> logged{0};
+        if (logged.fetch_add(1) < 10) {
+          XELOGI("NUI camera: colour settings #{} (window {}, gains {:08X})",
+                 uint32_t(generation), xe::load_and_swap<uint32_t>(r + 0x24),
+                 xe::load_and_swap<uint32_t>(r + 0x4C));
+        }
+        return kStatusSuccess;
+      }
 
       case 0x24:  // per-component state query: mode nibble at +0x1C and
                   // four values at +0x4C; report all zero.
@@ -1612,8 +1760,24 @@ class EmulatedNuiCamera {
             XELOGI("NUI camera: {} depth frames delivered", delivered);
           }
         } else if (buffer && size) {
-          std::memset(memory->TranslateVirtual(buffer), 0x80, size);
-          bytes = size;
+          bytes = stream == kStreamColour
+                      ? WriteBridgeColourFrame(memory->TranslateVirtual(buffer),
+                                               size)
+                      : 0;
+          if (bytes) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+              XELOGI("NUI camera: colour frames from the bridge's camera "
+                     "picture ({})",
+                     bytes == 0x4B000 ? "8-bit Bayer" : "16-bit YUV 4:2:2");
+            }
+          } else {
+            std::memset(memory->TranslateVirtual(buffer), 0x80, size);
+            bytes = size;
+          }
+        }
+        if (stream == kStreamColour) {
+          r[0x2C] = colour_generation_.load();
         }
         if (info) {
           xe::store_and_swap<uint32_t>(memory->TranslateVirtual(info),
@@ -1631,6 +1795,8 @@ class EmulatedNuiCamera {
   std::mutex mutex_;
   std::vector<uint32_t> pending_frames_;
   std::atomic<uint32_t> state_{kCamStateNeedsSetup};
+  // Number of the latest colour settings (request 0x23).
+  std::atomic<uint8_t> colour_generation_{0};
   bool cancel_pending_ = false;
   object_ref<XHostThread> frame_thread_;
   uint32_t frame_number_ = 0;
@@ -1961,6 +2127,7 @@ void WriteColourImage(cpu::ppc::PPCContext_s* ctx, const PlayerImageHook& hook,
   if (!cvars::kinect_live_colour) {
     return;
   }
+  NoteFaceColourUse();
   std::shared_ptr<const std::vector<uint8_t>> colour;
   uint32_t colour_width, colour_height;
   if (!SkeletonReceiver::Get().LatestColour(&colour, &colour_width,
@@ -2598,6 +2765,41 @@ void SkeletonHookHandler(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
     for (uint32_t i = 0; i < kJointCount; ++i) {
       StoreVector(s + 0x020 + i * 0x10, body.joints[i]);
       xe::store_and_swap<uint32_t>(s + 0x160 + i * 4, body.states[i]);
+    }
+  }
+
+  // Who is in the frame, logged whenever the slots, tracking IDs or states
+  // change (with how many of the 20 joints are tracked): a title that keeps
+  // losing the player shows whether the bridge's bodies flicker.
+  if (live_skeleton) {
+    static std::mutex who_mutex;
+    static std::string last_key;
+    static uint32_t who_logged = 0;
+    std::string key, text;
+    for (uint32_t b = 0; b < bodies.count; ++b) {
+      const ExternalBody& body = bodies.body[b];
+      uint32_t joints_tracked = 0;
+      for (uint32_t i = 0; i < kJointCount; ++i) {
+        joints_tracked += body.states[i] == 2;
+      }
+      const std::string id =
+          fmt::format(" [slot {} id {} {}", body.number - 1, body.tracking_id,
+                      body.state == 2 ? "tracked" : "position only");
+      key += id;
+      text += body.state == 2
+                  ? fmt::format("{}, {} joints tracked]", id, joints_tracked)
+                  : id + "]";
+    }
+    if (key.empty()) {
+      key = text = " nobody";
+    }
+    std::lock_guard<std::mutex> lock(who_mutex);
+    if (key != last_key && who_logged < 400) {
+      ++who_logged;
+      XELOGI("NUI skeleton bodies (frame {}):{}",
+             xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(frame + 0x08)),
+             text);
+      last_key = key;
     }
   }
 
@@ -3353,6 +3555,7 @@ void JdColourMappingHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
     XELOGI("{} colour mapping: hook at {:08X} active ({})", site.title,
            address, cvars::kinect_jd_colour_mapping);
   }
+  NoteFaceColourUse();
   // Mode and face offset: the bridge's settings win in "auto".
   bool whole_image = false;
   float bridge_offset = 0.0f;
@@ -3539,6 +3742,84 @@ void Jd4DebugPrintHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
   }
 }
 
+// Kinect Sports: Show Off & Share replays page their recorded frames (one
+// file per game frame in cache:) through a small pool of buffers. Each game
+// frame the replay loads the frame it is at and fetches it; the load finishes
+// a frame later, so a fetch only finds its frame when the replay advanced by
+// exactly one recorded frame per game frame, as on a console's steady 60 Hz.
+// With a PC's frame timing the replay soon skips a frame, every fetch misses
+// and the picture freezes until the timing happens to repeat a frame. At
+// 8248D720 (right after the fetch, r3 = found, r31 -> frame reference,
+// out-values at r1+0x50 / +0x54) hand a miss the loaded frame nearest to the
+// one asked for: the picture runs a frame behind instead of freezing.
+void KinectSportsReplayHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
+  static std::atomic<int> status{0};  // 0 unknown, 1 Kinect Sports, 2 not
+  if (status == 2) {
+    return;
+  }
+  auto word = [&](uint32_t a) {
+    return xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(a));
+  };
+  if (status == 0) {
+    // mtctr r11; bctrl; cmpwi r3, 0
+    status = word(address - 8) == 0x7D6903A6 &&
+                     word(address - 4) == 0x4E800421 &&
+                     word(address) == 0x2C030000
+                 ? 1
+                 : 2;
+    if (status == 2) {
+      return;
+    }
+    XELOGI("Kinect Sports replay fix: hook at {:08X} active", address);
+  }
+  if (uint32_t(ctx->r[3])) {
+    return;  // found
+  }
+  const uint32_t ref = word(uint32_t(ctx->r[31]));
+  // The frame reference: its fetch (vtable + 0x14) must be the paging one,
+  // 8248A158; +0xC = frame, +0x10 = pager (slot vector at +0, frame size at
+  // +0x10). A slot: +4 state (0 = loaded), +8 buffer, +0x14 frame.
+  if (!ref || word(word(ref) + 0x14) != 0x8248A158) {
+    return;
+  }
+  const int32_t frame = int32_t(word(ref + 0xC));
+  const uint32_t pager = word(ref + 0x10);
+  const uint32_t first = word(pager), last = word(pager + 4);
+  if (last < first || last - first > 64 * 4) {
+    return;
+  }
+  uint32_t best_buffer = 0;
+  int32_t best_distance = 7;  // at most 6 frames away
+  for (uint32_t s = first; s < last; s += 4) {
+    const uint32_t slot = word(s);
+    if (!slot || word(slot + 4) != 0) {
+      continue;
+    }
+    const int32_t distance = std::abs(int32_t(word(slot + 0x14)) - frame);
+    const uint32_t buffer = word(slot + 8);
+    if (distance && distance < best_distance && buffer) {
+      best_distance = distance;
+      best_buffer = buffer;
+    }
+  }
+  if (!best_buffer) {
+    return;
+  }
+  const uint32_t stack = uint32_t(ctx->r[1]);
+  xe::store_and_swap<uint32_t>(ctx->TranslateVirtual(stack + 0x50),
+                               best_buffer);
+  xe::store_and_swap<uint32_t>(ctx->TranslateVirtual(stack + 0x54),
+                               word(pager + 0x10));
+  ctx->r[3] = 1;
+  static std::atomic<uint32_t> used{0};
+  const uint32_t n = used.fetch_add(1);
+  if (n < 5 || n % 600 == 0) {
+    XELOGI("Kinect Sports replay fix: frame {} not loaded yet, showing one "
+           "{} frame(s) away (#{})",
+           frame, best_distance, n + 1);
+  }
+}
+
 void InstallTitleWorkarounds() {
   cpu::ppc::RegisterGuestHook(0x82C516E0, Jd2014ColourMappingHook);
   cpu::ppc::RegisterGuestHook(0x82C51938, Jd2014ColourMappingHook);
@@ -3568,6 +3849,7 @@ void InstallTitleWorkarounds() {
   for (const DeliberateFaultFix& fix : kDeliberateFaultFixes) {
     cpu::ppc::RegisterGuestHook(fix.fault_address, DeliberateFaultHook);
   }
+  cpu::ppc::RegisterGuestHook(0x8248D720, KinectSportsReplayHook);
 }
 
 }  // namespace

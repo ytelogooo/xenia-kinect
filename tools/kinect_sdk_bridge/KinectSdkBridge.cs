@@ -404,6 +404,23 @@ class BridgeForm : Form {
   Queue<DateTime> tilt_moves_ = new Queue<DateTime>();
   string tilt_error_;
 
+  // Xenia asks for the whole camera image while the game reads the camera's
+  // colour stream itself (Kinect Sports' Show Off & Share) and no Just Dance
+  // face hook is using the picture: "XKCM", u32 version 1, u32 flags (1 =
+  // whole image, 0 = face crop). A whole-image request lasts 3 s; Xenia
+  // repeats it about once a second.
+  long xenia_whole_until_ = 0;  // DateTime.UtcNow ticks; Interlocked
+
+  bool XeniaWantsWhole() {
+    return DateTime.UtcNow.Ticks <
+           System.Threading.Interlocked.Read(ref xenia_whole_until_);
+  }
+
+  // Whether the colour image sent is the face crop.
+  bool CropFaces() {
+    return options_.FaceCrop && colour_error_ == null && !XeniaWantsWhole();
+  }
+
   void ReceiveFromXenia() {
     IPEndPoint from = null;
     while (true) {
@@ -421,6 +438,18 @@ class BridgeForm : Form {
         chosen_first_ = BitConverter.ToInt32(p, 8);
         chosen_second_ = BitConverter.ToInt32(p, 12);
         choice_pending_ = true;
+        continue;
+      }
+      if (p.Length >= 12 && p[0] == 'X' && p[1] == 'K' && p[2] == 'C' &&
+          p[3] == 'M' && BitConverter.ToUInt32(p, 4) == 1) {
+        bool was_whole = XeniaWantsWhole();
+        bool whole = (BitConverter.ToUInt32(p, 8) & 1) != 0;
+        System.Threading.Interlocked.Exchange(
+            ref xenia_whole_until_,
+            whole ? DateTime.UtcNow.AddSeconds(3).Ticks : 0);
+        if (whole != was_whole) {
+          SendFaceSettings();
+        }
         continue;
       }
       if (p.Length >= 12 && p[0] == 'X' && p[1] == 'K' && p[2] == 'T' &&
@@ -732,7 +761,7 @@ class BridgeForm : Form {
     p[2] = (byte)'F';
     p[3] = (byte)'O';
     BitConverter.GetBytes((uint)1).CopyTo(p, 4);
-    bool whole = !options_.FaceCrop || colour_error_ != null;
+    bool whole = !CropFaces();
     BitConverter.GetBytes((uint)(whole ? 1 : 0)).CopyTo(p, 8);
     BitConverter.GetBytes(options_.FaceOffset).CopyTo(p, 12);
     try {
@@ -1032,8 +1061,7 @@ class BridgeForm : Form {
   string colour_error_;   // why the colour image / face crop was switched off
 
   byte[] ImageToSend() {
-    if (!options_.FaceCrop || colour_error_ != null || !face_found_ ||
-        face_z_ < 0.5f) {
+    if (!CropFaces() || !face_found_ || face_z_ < 0.5f) {
       crop_valid_ = false;
       return video_work_;
     }
@@ -1389,13 +1417,15 @@ class BridgeForm : Form {
     string line2 = status_ + "   Skeleton frames/s: " +
                    rate_.ToString("0", CultureInfo.InvariantCulture) +
                    (sensor_ != null ? TiltText() : "") +
-                   (options_.FaceCrop && colour_error_ == null
+                   (CropFaces()
                         ? "   Face crop: " + options_.FaceSize.ToString(
                               "0.00", CultureInfo.InvariantCulture) + " m, " +
                               options_.FaceOffset.ToString(
                                   "0.00", CultureInfo.InvariantCulture) +
                               " m down (Z/X zoom, W/S move)"
-                        : "   Whole camera image; face " +
+                        : (XeniaWantsWhole() ? "   Whole camera image (the game's"
+                                              + " colour stream); face "
+                                              : "   Whole camera image; face ") +
                               options_.FaceOffset.ToString(
                                   "0.00", CultureInfo.InvariantCulture) +
                               " m down (W/S)") +
