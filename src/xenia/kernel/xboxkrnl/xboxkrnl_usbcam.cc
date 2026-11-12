@@ -116,6 +116,11 @@ DEFINE_bool(kinect_debug_jd4_hand, false,
             "Diagnostic for Just Dance 4: log the right-hand position the "
             "game uses next to the one in the skeleton frame it received.",
             "Kernel");
+DEFINE_bool(kinect_auto_hooks, true,
+            "When a title loads, look for the Kinect runtime code the "
+            "skeleton and player-image hooks need, so titles without a "
+            "built-in hook get the bridges' skeletons and silhouettes too.",
+            "HID");
 DEFINE_bool(jd4_debug_print, false,
             "Diagnostic for Just Dance 4: log the game's own debug messages "
             "(its print function, 82211F20, is empty in the retail game), "
@@ -2144,18 +2149,28 @@ constexpr ImageFrameHook kKnownImageFrameHooks[] = {
      (1u << 0) | (1u << 7) | (1u << 4)},
 };
 
-std::atomic<int> image_frame_hook_status[4];
+// The known hooks plus any found by ScanTitleForHooks (reserved so that
+// adding one never moves the others).
+constexpr size_t kMaxImageFrameHooks = 16;
+std::vector<ImageFrameHook> active_image_frame_hooks = [] {
+  std::vector<ImageFrameHook> hooks;
+  hooks.reserve(kMaxImageFrameHooks);
+  hooks.assign(std::begin(kKnownImageFrameHooks),
+               std::end(kKnownImageFrameHooks));
+  return hooks;
+}();
+std::atomic<int> image_frame_hook_status[kMaxImageFrameHooks];
 
 void ImageFrameHookHandler(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
   size_t index = 0;
-  while (index < std::size(kKnownImageFrameHooks) &&
-         kKnownImageFrameHooks[index].address != address) {
+  while (index < active_image_frame_hooks.size() &&
+         active_image_frame_hooks[index].address != address) {
     ++index;
   }
-  if (index == std::size(kKnownImageFrameHooks)) {
+  if (index == active_image_frame_hooks.size()) {
     return;
   }
-  const ImageFrameHook& hook = kKnownImageFrameHooks[index];
+  const ImageFrameHook& hook = active_image_frame_hooks[index];
   std::atomic<int>& status = image_frame_hook_status[index];
   if (status.load(std::memory_order_relaxed) == 2) {
     return;
@@ -2335,7 +2350,7 @@ void InstallPlayerImageHooks() {
   for (const PlayerImageHook& hook : kKnownPlayerImageHooks) {
     cpu::ppc::RegisterGuestHook(hook.address, PlayerImageHookHandler);
   }
-  for (const ImageFrameHook& hook : kKnownImageFrameHooks) {
+  for (const ImageFrameHook& hook : active_image_frame_hooks) {
     cpu::ppc::RegisterGuestHook(hook.address, ImageFrameHookHandler);
   }
 }
@@ -2383,7 +2398,10 @@ constexpr SkeletonHook kKnownSkeletonHooks[] = {
 
 std::vector<SkeletonHook> active_skeleton_hooks;
 // Per hook: 0 = not checked yet, 1 = matches, 2 = does not match.
-std::atomic<int> skeleton_hook_status[std::size(kKnownSkeletonHooks)];
+constexpr size_t kMaxSkeletonHooks = std::size(kKnownSkeletonHooks) + 8;
+std::atomic<int> skeleton_hook_status[kMaxSkeletonHooks];
+// Whether InstallSkeletonHook set the hooks up (so a scan may add to them).
+bool skeleton_hooks_installed = false;
 
 void StoreVector(uint8_t* p, const Vec3& mm) {
   xe::store_and_swap<float>(p + 0x0, mm.x * 0.001f);
@@ -2754,8 +2772,10 @@ void InstallSkeletonHook() {
     }
     active_skeleton_hooks.push_back(hook);
   } else {
+    active_skeleton_hooks.reserve(kMaxSkeletonHooks);
     active_skeleton_hooks.assign(std::begin(kKnownSkeletonHooks),
                                  std::end(kKnownSkeletonHooks));
+    skeleton_hooks_installed = true;
   }
   InstallPlayerImageHooks();
   if (cvars::kinect_connected && cvars::kinect_skeleton_udp_port) {
@@ -2904,8 +2924,17 @@ constexpr DeliberateFaultFix kDeliberateFaultFixes[] = {
      0x82311A40},
 };
 
+// The known fixes plus any ScanTitleForHooks finds (Dance Central 2 too).
+std::vector<DeliberateFaultFix> active_fault_fixes = [] {
+  std::vector<DeliberateFaultFix> fixes;
+  fixes.reserve(8);
+  fixes.assign(std::begin(kDeliberateFaultFixes),
+               std::end(kDeliberateFaultFixes));
+  return fixes;
+}();
+
 void DeliberateFaultHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
-  for (const DeliberateFaultFix& fix : kDeliberateFaultFixes) {
+  for (const DeliberateFaultFix& fix : active_fault_fixes) {
     if (fix.fault_address != address) {
       continue;
     }
@@ -3542,6 +3571,214 @@ void InstallTitleWorkarounds() {
 }
 
 }  // namespace
+// --- Finding the hooks in any title -------------------------------------------
+// The hooks above sit in Microsoft's NUI runtime, which every Kinect title
+// links its own copy of: the code is the same in each NUI version, only its
+// address differs (and moves with title updates). So when a title loads, look
+// for the code itself, and hook where it is found. Matching code was checked
+// against Kinect Adventures, Just Dance 3, 4 (with and without its title
+// update), 2015, 2017 and Dance Central 3: one match each, at the known
+// address.
+
+struct CodePattern {
+  uint32_t mask;
+  uint32_t value;
+};
+
+// NuiSkeletonGetNextFrame, around the memcpy of the 0xAB0-byte frame into the
+// caller's buffer; the hook is the instruction after the memcpy (index 9).
+constexpr CodePattern kSkeletonCopyPattern[] = {
+    {0xFFFFFFFF, 0x1D6B0AE0},  // mulli r11, r11, 0xAE0
+    {0xFFFFFFFF, 0x7FCB5214},  // add r30, r11, r10
+    {0xFFFFFFFF, 0x7D6B502E},  // lwzx r11, r11, r10
+    {0xFFFFFFFF, 0x2F0B0001},  // cmpwi cr6, r11, 1
+    {0xFFFF0003, 0x409A0000},  // bne cr6, ...
+    {0xFFFFFFFF, 0x38A00AB0},  // li r5, 0xAB0
+    {0xFFFFFFFF, 0x389E0020},  // addi r4, r30, 0x20
+    {0xFC1F07FF, 0x7C030378},  // mr r3, rFrame
+    {0xFC000003, 0x48000001},  // bl memcpy
+    {0xFC1FFFFF, 0x901E0000},  // stw rN, 0(r30)  <- hook
+    {0xFFFFFFFF, 0x7D6C42E6},  // mftb r11
+    {0xFFFFFFFF, 0x815E0AD0},  // lwz r10, 0xAD0(r30)
+    {0xFFFFFFFF, 0x5569003E},  // slwi r9, r11, 0
+    {0xFFFFFFFF, 0x3D00000F},  // lis r8, 0xF
+    {0xFFFFFFFF, 0x7CEA4850},  // subf r7, r10, r9
+};
+constexpr size_t kSkeletonCopyHookIndex = 9;
+
+// NuiImageStreamGetNextFrame, where it hands the frame (r9) to the caller;
+// the hook is the instruction after "stw r9, 0(r28)" (index 15). Not in Kinect
+// Adventures' older runtime.
+constexpr CodePattern kImageFramePattern[] = {
+    {0xFFFFFFFF, 0x93AB0038}, {0xFFFFFFFF, 0x392B0008},
+    {0xFFFFFFFF, 0x81410050}, {0xFFFFFFFF, 0x7F63DB78},
+    {0xFFFFFFFF, 0x810A0030}, {0xFFFFFFFF, 0x394A0030},
+    {0xFFFFFFFF, 0x910B0000}, {0xFFFFFFFF, 0x914B0004},
+    {0xFFFFFFFF, 0x91680004}, {0xFFFFFFFF, 0x916A0000},
+    {0xFFFFFFFF, 0x81610050}, {0xFFFFFFFF, 0x814B002C},
+    {0xFFFFFFFF, 0x38EA0001}, {0xFFFFFFFF, 0x90EB002C},
+    {0xFFFFFFFF, 0x913C0000},  // stw r9, 0(r28)
+    {0xFC000003, 0x48000001},  // bl  <- hook
+    {0xFC000003, 0x48000000},  // b
+};
+constexpr size_t kImageFrameHookIndex = 15;
+
+template <size_t N>
+std::vector<uint32_t> FindCode(const uint8_t* image, uint32_t base,
+                               uint32_t size, const CodePattern (&pattern)[N]) {
+  std::vector<uint32_t> found;
+  const uint32_t words = size / 4;
+  for (uint32_t i = 0; i + N <= words; ++i) {
+    if ((xe::load_and_swap<uint32_t>(image + i * 4) & pattern[0].mask) !=
+        pattern[0].value) {
+      continue;
+    }
+    bool match = true;
+    for (size_t k = 1; k < N && match; ++k) {
+      match = (xe::load_and_swap<uint32_t>(image + (i + k) * 4) &
+               pattern[k].mask) == pattern[k].value;
+    }
+    if (match) {
+      found.push_back(base + i * 4);
+    }
+  }
+  return found;
+}
+
+// Harmonix's Milo engine (Dance Central 2 and 3) runs its main loop from the
+// unhandled-exception filter: it registers the filter (lis r9 / addi r3, r9
+// = the callback; bl SetUnhandledExceptionFilter), then faults on purpose
+// with "li r10, 1; stw r10, 0(0)". Find that, so DeliberateFaultHook calls
+// the callback instead of the title crashing.
+void ScanForDeliberateFaults(const uint8_t* image, uint32_t base,
+                             uint32_t size) {
+  const auto word = [&](uint32_t address) {
+    return xe::load_and_swap<uint32_t>(image + (address - base));
+  };
+  for (uint32_t offset = 8 * 4; offset + 4 <= size; offset += 4) {
+    const uint32_t address = base + offset;
+    if (word(address) != 0x91400000 /* stw r10, 0(0) */ ||
+        word(address - 4) != 0x39400001 /* li r10, 1 */) {
+      continue;
+    }
+    uint32_t high = 0, low = 0;
+    bool have_high = false, have_low = false, have_call = false;
+    for (uint32_t back = 2; back <= 8; ++back) {
+      const uint32_t w = word(address - back * 4);
+      if ((w >> 16) == 0x3869 && !have_low) {  // addi r3, r9, low
+        low = w & 0xFFFF;
+        have_low = true;
+      } else if ((w >> 16) == 0x3D20 && !have_high) {  // lis r9, high
+        high = w & 0xFFFF;
+        have_high = true;
+      } else if ((w & 0xFC000003) == 0x48000001) {  // bl
+        have_call = true;
+      }
+    }
+    if (!have_high || !have_low || !have_call) {
+      continue;
+    }
+    const uint32_t handler = (high << 16) + uint32_t(int32_t(int16_t(low)));
+    if (handler < base || handler >= base + size ||
+        word(handler) != 0x7D8802A6 /* mflr r12 */) {
+      continue;
+    }
+    bool known = false;
+    for (const DeliberateFaultFix& fix : active_fault_fixes) {
+      known |= fix.fault_address == address;
+    }
+    if (known || active_fault_fixes.size() >= 8) {
+      continue;
+    }
+    active_fault_fixes.push_back(
+        {"this title (found by code scan)", address, 0x91400000, handler});
+    cpu::ppc::RegisterGuestHook(address, DeliberateFaultHook);
+    XELOGI("Found a deliberate fault at {:08X} that runs {:08X} from the "
+           "exception filter; it will be called directly",
+           address, handler);
+  }
+}
+
+void ScanTitleForHooks(Memory* memory, uint32_t base, uint32_t size) {
+  if (!size) {
+    return;
+  }
+  const uint8_t* image = memory->TranslateVirtual(base);
+  ScanForDeliberateFaults(image, base, size);
+  if (!cvars::kinect_auto_hooks || !skeleton_hooks_installed) {
+    return;
+  }
+  const auto word = [&](uint32_t address) {
+    return xe::load_and_swap<uint32_t>(image + (address - base));
+  };
+  const auto in_image = [&](uint32_t address) {
+    return address >= base + 4 && address < base + size;
+  };
+
+  for (uint32_t start : FindCode(image, base, size, kSkeletonCopyPattern)) {
+    const uint32_t address = start + uint32_t(kSkeletonCopyHookIndex) * 4;
+    const uint32_t mr = word(address - 8);
+    const uint32_t frame_register = (mr >> 21) & 31;
+    if (((mr >> 11) & 31) != frame_register) {
+      continue;  // not "mr r3, rX"
+    }
+    bool known = false;
+    for (const SkeletonHook& hook : active_skeleton_hooks) {
+      known |= hook.address == address;
+    }
+    if (known) {
+      XELOGI("NUI skeleton: found NuiSkeletonGetNextFrame's frame copy at "
+             "{:08X} (a known hook)",
+             address);
+      continue;
+    }
+    if (active_skeleton_hooks.size() >= kMaxSkeletonHooks) {
+      break;
+    }
+    active_skeleton_hooks.push_back(
+        {"this title (found by code scan)", address, frame_register,
+         word(address - 4)});
+    cpu::ppc::RegisterGuestHook(address, SkeletonHookHandler);
+    XELOGI("NUI skeleton: found NuiSkeletonGetNextFrame's frame copy at "
+           "{:08X}, frame in r{}; hooked",
+           address, frame_register);
+  }
+
+  if (!cvars::kinect_player_index) {
+    return;
+  }
+  // Titles with a hook on their own copy of the image keep that one.
+  for (const PlayerImageHook& hook : kKnownPlayerImageHooks) {
+    if (in_image(hook.address) &&
+        word(hook.address - 4) == hook.expected_previous) {
+      return;
+    }
+  }
+  for (uint32_t start : FindCode(image, base, size, kImageFramePattern)) {
+    const uint32_t address = start + uint32_t(kImageFrameHookIndex) * 4;
+    bool known = false;
+    for (const ImageFrameHook& hook : active_image_frame_hooks) {
+      known |= hook.address == address;
+    }
+    if (known) {
+      XELOGI("NUI image frame: found NuiImageStreamGetNextFrame at {:08X} (a "
+             "known hook)",
+             address);
+      continue;
+    }
+    if (active_image_frame_hooks.size() >= kMaxImageFrameHooks) {
+      break;
+    }
+    active_image_frame_hooks.push_back(
+        {"this title (found by code scan)", address, word(address - 4), 9,
+         (1u << 0) | (1u << 7) | (1u << 4)});
+    cpu::ppc::RegisterGuestHook(address, ImageFrameHookHandler);
+    XELOGI("NUI image frame: found NuiImageStreamGetNextFrame at {:08X}; "
+           "hooked",
+           address);
+  }
+}
+
 }  // namespace xboxkrnl
 }  // namespace kernel
 }  // namespace xe

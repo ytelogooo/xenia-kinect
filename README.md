@@ -94,6 +94,7 @@ Tested by the fork owner. "Bridge" means either bridge.
 | Just Dance 2015 | ✅ Playable | ✅ | Faces for up to two players; DLC |
 | Just Dance 2016 | ✅ Playable | ❓ | Face in the player square matches a console |
 | Just Dance 2017 | ❓ | ✅ | Two full skeletons, faces |
+| Dance Central 2 | ❓ | ✅ Playable | No game-specific code: hooks found automatically |
 | Dance Central 3 | ❓ | ✅ | Player outline; songs decrypt without console keys |
 
 ❓ = not tested yet in that mode. Tried a game? Open an issue with the game,
@@ -115,6 +116,10 @@ the mode, what worked and your `xenia.log`.
   Kinect Tuner dialog, avatars from the system avatar asset pack.
 - Per-game support for player images, faces and hand tracking in Just Dance
   2014–2017, Just Dance 3/4 and Dance Central 3.
+- Bridges in other games: when a game loads, Xenia looks for the Kinect
+  runtime code its skeleton and player-image hooks need, so games without a
+  built-in hook can get your skeleton and silhouette too
+  (`[HID] kinect_auto_hooks`).
 
 ### Performance (Direct3D 12)
 - Resolve rectangle lists done as one batch instead of one GPU stall per

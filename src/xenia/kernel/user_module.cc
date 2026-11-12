@@ -23,6 +23,12 @@ DEFINE_path(dump_title_image, "",
             "between versions.",
             "Kernel");
 
+namespace xe::kernel::xboxkrnl {
+// xboxkrnl_usbcam.cc: hooks code found in the title (the Kinect runtime's
+// skeleton and image functions, Milo's deliberate fault).
+void ScanTitleForHooks(Memory* memory, uint32_t base, uint32_t size);
+}  // namespace xe::kernel::xboxkrnl
+
 namespace xe {
 namespace kernel {
 
@@ -228,6 +234,12 @@ X_STATUS UserModule::LoadContinue() {
   // Finish XexModule load (PE sections/imports/symbols...)
   if (!xex_module()->LoadContinue()) {
     return X_STATUS_UNSUCCESSFUL;
+  }
+
+  if (!(xex_module()->xex_header()->module_flags & XEX_MODULE_DLL_MODULE)) {
+    xboxkrnl::ScanTitleForHooks(
+        memory(), xex_module()->base_address(),
+        xex_module()->xex_security_info()->image_size);
   }
 
   if (!cvars::dump_title_image.empty() &&
