@@ -12,11 +12,12 @@ if "%~1"=="" (
 )
 if not exist "%BRIDGE%" (
   echo Building the Kinect SDK bridge ^(first run only^)...
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%HERE%tools\kinect_sdk_bridge\build.ps1"
-  if errorlevel 1 (
+  rem Full path: PowerShell's folder isn't always on PATH.
+  "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%HERE%tools\kinect_sdk_bridge\build.ps1"
+  if not exist "%BRIDGE%" (
     echo.
-    echo The bridge could not be built. Install the Kinect for Windows SDK 1.8
-    echo and try again.
+    echo The bridge could not be built ^(the message above says why^). It needs
+    echo the Kinect for Windows SDK 1.8 installed.
     pause
     exit /b 1
   )
