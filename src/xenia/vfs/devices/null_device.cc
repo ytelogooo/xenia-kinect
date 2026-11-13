@@ -9,6 +9,8 @@
 
 #include "xenia/vfs/devices/null_device.h"
 
+#include <cctype>
+
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -57,6 +59,63 @@ Entry* NullDevice::ResolvePath(const std::string_view path) {
   }
 
   return nullptr;
+}
+
+namespace {
+constexpr uint64_t kCachePartitionBytes = 0x80000000ull;  // 2 GiB
+
+// "\\Cache1" from an entry path such as "\\Cache1" or "\\Cache1\\".
+std::string VolumeOf(const std::string& path) {
+  std::string volume = path;
+  while (volume.size() > 1 && (volume.back() == '\\' || volume.back() == '/')) {
+    volume.pop_back();
+  }
+  const size_t next = volume.find('\\', 1);
+  if (next != std::string::npos) {
+    volume.resize(next);
+  }
+  for (char& c : volume) {
+    c = char(std::tolower(uint8_t(c)));
+  }
+  return volume;
+}
+}  // namespace
+
+void NullDevice::NoteFatxFormat(const std::string& volume,
+                                uint32_t sectors_per_cluster) {
+  std::lock_guard<std::mutex> lock(formats_mutex_);
+  auto& noted = formatted_sectors_per_cluster_[VolumeOf(volume)];
+  if (noted != sectors_per_cluster) {
+    XELOGI("NullDevice: {}{} formatted as FATX with {}-byte clusters",
+           mount_path_, volume, sectors_per_cluster * bytes_per_sector());
+  }
+  noted = sectors_per_cluster;
+}
+
+uint32_t NullDevice::FormattedSectorsPerCluster(const Entry* entry) const {
+  if (!entry) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lock(formats_mutex_);
+  auto it = formatted_sectors_per_cluster_.find(VolumeOf(entry->path()));
+  return it == formatted_sectors_per_cluster_.end() ? 0 : it->second;
+}
+
+uint64_t NullDevice::TotalAllocationUnitsFor(const Entry* entry) const {
+  const uint32_t sectors = FormattedSectorsPerCluster(entry);
+  return sectors ? kCachePartitionBytes / (uint64_t(sectors) * bytes_per_sector())
+                 : total_allocation_units();
+}
+
+uint64_t NullDevice::AvailableAllocationUnitsFor(const Entry* entry) const {
+  const uint32_t sectors = FormattedSectorsPerCluster(entry);
+  return sectors ? kCachePartitionBytes / (uint64_t(sectors) * bytes_per_sector())
+                 : available_allocation_units();
+}
+
+uint32_t NullDevice::SectorsPerAllocationUnitFor(const Entry* entry) const {
+  const uint32_t sectors = FormattedSectorsPerCluster(entry);
+  return sectors ? sectors : sectors_per_allocation_unit();
 }
 
 }  // namespace vfs

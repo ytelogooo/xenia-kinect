@@ -92,10 +92,11 @@ Tested by the fork owner. "Bridge" means either bridge.
 | Just Dance 4 | ✅ Playable | ✅ | More than 14 DLC packs need title update 1 (see below) |
 | Just Dance 2014 | ✅ Playable | ✅ Playable | Player faces in the player slots |
 | Just Dance 2015 | ✅ Playable | ✅ | Faces for up to two players; DLC |
-| Just Dance 2016 | ✅ Playable | ❓ | Face in the player square matches a console |
+| Just Dance 2016 | ✅ Playable | ✅ | Face in the player square matches a console |
 | Just Dance 2017 | ❓ | ✅ | Two full skeletons, faces |
 | Dance Central 2 | ❓ | ✅ Playable | No game-specific code: hooks found automatically |
 | Dance Central 3 | ❓ | ✅ | Player outline; songs decrypt without console keys |
+| Kinect Sports | ✅ Playable | ✅ Playable | Hooks found automatically; Show Off & Share photos and replays work |
 
 ❓ = not tested yet in that mode. Tried a game? Open an issue with the game,
 the mode, what worked and your `xenia.log`.
@@ -170,8 +171,10 @@ motor or microphones).
 
 - Only the Kinect for Xbox 360 (v1) is supported; Kinect for Xbox One / v2
   isn't.
-- Real Kinect and the SDK bridge can't run at the same time (one program owns
-  the Kinect).
+- Real Kinect and the SDK bridge can't use the Kinect at the same time. If
+  the bridge is running when a game starts, Xenia leaves the Kinect to it
+  even with `allow_kinect_camera = true`; close the bridge to play in real
+  Kinect mode.
 - Real Kinect mode: a player already standing still when the game starts may
   not be picked up (seen in Kinect Adventures and Just Dance 4) — step out of
   view and back in.
@@ -182,6 +185,13 @@ motor or microphones).
   14 DLC packs makes the game load only one of them — a bug in the game
   itself, fixed by the update. Install the update with **File → Install
   Content…**. All three ways to play work with and without the update.
+- Kinect Adventures: on the "Face the sensor!" screen at start-up,
+  **Calibrate faster** can make the Kinect hunt up and down (the game loses
+  you each time it tilts and Xenia's tracker doesn't find you again in time).
+  If the Kinect is already placed well, `[Kernel] kinect_auto_tilt = false`
+  keeps it still.
+- Kinect Sports: its cache folder grows to about 840 MB. That's normal: the
+  game keeps its Show Off & Share replays there as raw video frames.
 - Real Kinect mode is Windows only.
 
 ## Building

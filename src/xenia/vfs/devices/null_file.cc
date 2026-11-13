@@ -9,6 +9,10 @@
 
 #include "xenia/vfs/devices/null_file.h"
 
+#include <cstring>
+
+#include "xenia/base/byte_order.h"
+#include "xenia/vfs/devices/null_device.h"
 #include "xenia/vfs/devices/null_entry.h"
 
 namespace xe {
@@ -37,6 +41,22 @@ X_STATUS NullFile::WriteSync(std::span<const uint8_t> buffer,
     return X_STATUS_ACCESS_DENIED;
   }
 
+  // A FATX header ("XTAF", volume ID, sectors per cluster): the title is
+  // formatting this cache partition and will check the cluster size.
+  if (byte_offset == 0 && buffer.size() >= 12 &&
+      std::memcmp(buffer.data(), "XTAF", 4) == 0) {
+    const uint32_t sectors_per_cluster =
+        xe::load_and_swap<uint32_t>(buffer.data() + 8);
+    if (sectors_per_cluster && sectors_per_cluster <= 0x100 &&
+        !(sectors_per_cluster & (sectors_per_cluster - 1))) {
+      static_cast<NullDevice*>(entry()->device())
+          ->NoteFatxFormat(entry()->path(), sectors_per_cluster);
+    }
+  }
+  // Like a disk: everything asked for is written.
+  if (out_bytes_written) {
+    *out_bytes_written = buffer.size();
+  }
   return X_STATUS_SUCCESS;
 }
 

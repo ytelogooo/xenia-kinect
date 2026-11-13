@@ -650,6 +650,19 @@ class SkeletonReceiver {
   // Number of skeleton packets received so far.
   uint32_t packet_count() const { return packet_count_.load(); }
 
+  // Whether the bridge sent anything in the last max_age_s seconds.
+  bool HeardFromBridge(double max_age_s) const {
+    const int64_t last = last_packet_ms_.load();
+    if (!last) {
+      return false;
+    }
+    const int64_t now =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    return double(now - last) <= max_age_s * 1000.0;
+  }
+
   // Latest skeleton if it is newer than max_age_s.
   bool Latest(ExternalSkeleton* out, double max_age_s) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1141,6 +1154,12 @@ class SkeletonReceiver {
                                  int(buffer.size()), 0,
                                  reinterpret_cast<sockaddr*>(&from),
                                  &from_length));
+      if (n >= 4 && packet[0] == 'X' && packet[1] == 'K') {
+        last_packet_ms_ =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+      }
       if (n >= 4 && from.sin_family == AF_INET &&
           (std::memcmp(packet, "XKSK", 4) == 0 ||
            std::memcmp(packet, "XKTS", 4) == 0)) {
@@ -1221,6 +1240,7 @@ class SkeletonReceiver {
   bool started_ = false;
   bool have_ = false;
   std::atomic<uint32_t> packet_count_{0};
+  std::atomic<int64_t> last_packet_ms_{0};
   ExternalSkeleton latest_;
   ExternalSkeleton previous_;
   ExternalBodies bodies_;
@@ -1312,6 +1332,14 @@ void NoteFaceColourUse() {
 
 // Called for each emulated colour frame.
 void RequestWholeColourIfUnused() {
+  // Just Dance titles show the player's face from the colour stream even
+  // without one of the face hooks (Just Dance 2016): keep the bridge's crop.
+  static const bool just_dance =
+      kernel_state()->emulator()->title_name().find("Just Dance") !=
+      std::string::npos;
+  if (just_dance) {
+    return;
+  }
   const int64_t now = SteadyMs();
   const int64_t face = face_colour_used_ms.load(std::memory_order_relaxed);
   if (face && now - face < 3000) {
@@ -3064,6 +3092,35 @@ bool KinectGetTunerView(KinectTunerView* view) {
   return true;
 }
 
+// With allow_kinect_camera Xenia opens the real Kinect itself, which takes
+// it from the Kinect SDK bridge if that is running (the bridge stops
+// working). Decided once, at the title's first camera request: if the
+// bridge (kinect_skeleton_udp_port) has been heard from, it is used and the
+// real Kinect is left alone.
+std::atomic<int> real_kinect_allowed{-1};
+
+bool RealKinectAllowed() {
+  if (!cvars::allow_kinect_camera) {
+    return false;
+  }
+  int allowed = real_kinect_allowed.load();
+  if (allowed < 0) {
+    const bool bridge = cvars::kinect_connected &&
+                        cvars::kinect_skeleton_udp_port &&
+                        SkeletonReceiver::Get().HeardFromBridge(3.0);
+    allowed = bridge ? 0 : 1;
+    int expected = -1;
+    if (real_kinect_allowed.compare_exchange_strong(expected, allowed) &&
+        bridge) {
+      XELOGI("Kinect: the Kinect SDK bridge is running, so the real Kinect "
+             "is left to it (allow_kinect_camera ignored); close the bridge "
+             "to use the real Kinect directly");
+    }
+    allowed = real_kinect_allowed.load();
+  }
+  return allowed == 1;
+}
+
 dword_result_t PsCamDeviceRequest_entry(lpvoid_t request,
                                         const ppc_context_t& context) {
   if (!request) {
@@ -3072,7 +3129,8 @@ dword_result_t PsCamDeviceRequest_entry(lpvoid_t request,
   // A real Kinect (allow_kinect_camera) takes priority; without one the
   // emulated sensor answers as before.
   uint32_t usb_status;
-  if (usb_kinect::TryHandleRequest(request.guest_address(), &usb_status)) {
+  if (RealKinectAllowed() &&
+      usb_kinect::TryHandleRequest(request.guest_address(), &usb_status)) {
     return usb_status;
   }
   if (!cvars::kinect_connected) {
@@ -3356,7 +3414,7 @@ void Jd4FilterDebugHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
 // the game's own hand tracker sees real images and works as on a console
 // (scoring felt better with it).
 bool Jd4SkeletonHands() {
-  return cvars::kinect_jd4_skeleton_hands && !cvars::allow_kinect_camera;
+  return cvars::kinect_jd4_skeleton_hands && !usb_kinect::IsActive();
 }
 
 // kinect_jd4_hand_flag: at 8298D254 / 8298D2A4 (lwz r6, 0x1DC / 0x25C(r11),

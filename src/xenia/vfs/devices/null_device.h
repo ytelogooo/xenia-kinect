@@ -10,6 +10,8 @@
 #ifndef XENIA_VFS_DEVICES_NULL_DEVICE_H_
 #define XENIA_VFS_DEVICES_NULL_DEVICE_H_
 
+#include <map>
+#include <mutex>
 #include <string>
 
 #include "xenia/vfs/device.h"
@@ -45,7 +47,22 @@ class NullDevice : public Device {
   // STFC requires <= 0x1000
   uint32_t bytes_per_sector() const override { return 0x200; }
 
+  // A title formatting a cache partition itself (XMountUtilityDrive of older
+  // XDKs, Just Dance 4) writes a FATX ("XTAF") header with its cluster size
+  // and then checks the volume reports that size; a 360 cache partition is
+  // 2 GiB.
+  void NoteFatxFormat(const std::string& volume, uint32_t sectors_per_cluster);
+  uint64_t TotalAllocationUnitsFor(const Entry* entry) const override;
+  uint64_t AvailableAllocationUnitsFor(const Entry* entry) const override;
+  uint32_t SectorsPerAllocationUnitFor(const Entry* entry) const override;
+
  private:
+  // The formatted volume ("\\Cache1") an entry is on, or 0 sectors.
+  uint32_t FormattedSectorsPerCluster(const Entry* entry) const;
+
+  mutable std::mutex formats_mutex_;
+  std::map<std::string, uint32_t> formatted_sectors_per_cluster_;
+
   std::string name_;
   std::unique_ptr<Entry> root_entry_;
   std::vector<std::string> null_paths_;

@@ -43,6 +43,18 @@ class Device {
   virtual uint32_t sectors_per_allocation_unit() const = 0;
   virtual uint32_t bytes_per_sector() const = 0;
 
+  // The volume size for a file on this device; a device holding several
+  // volumes (NullDevice's cache partitions) may answer per volume.
+  virtual uint64_t TotalAllocationUnitsFor(const Entry* entry) const {
+    return total_allocation_units();
+  }
+  virtual uint64_t AvailableAllocationUnitsFor(const Entry* entry) const {
+    return available_allocation_units();
+  }
+  virtual uint32_t SectorsPerAllocationUnitFor(const Entry* entry) const {
+    return sectors_per_allocation_unit();
+  }
+
  protected:
   xe::global_critical_region global_critical_region_;
   std::string mount_path_;

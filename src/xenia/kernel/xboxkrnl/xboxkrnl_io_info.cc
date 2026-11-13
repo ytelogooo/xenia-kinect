@@ -368,9 +368,12 @@ dword_result_t NtQueryVolumeInformationFile_entry(
     case XFileFsSizeInformation: {
       auto device = file->device();
       auto info = info_ptr.as<X_FILE_FS_SIZE_INFORMATION*>();
-      info->total_allocation_units = device->total_allocation_units();
-      info->available_allocation_units = device->available_allocation_units();
-      info->sectors_per_allocation_unit = device->sectors_per_allocation_unit();
+      info->total_allocation_units =
+          device->TotalAllocationUnitsFor(file->entry());
+      info->available_allocation_units =
+          device->AvailableAllocationUnitsFor(file->entry());
+      info->sectors_per_allocation_unit =
+          device->SectorsPerAllocationUnitFor(file->entry());
       info->bytes_per_sector = device->bytes_per_sector();
       // TODO(gibbed): sanity check, XCTD userland code seems to require this.
       assert_true(info->bytes_per_sector == 0x200);
