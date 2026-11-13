@@ -22,10 +22,19 @@
 #include "xenia/kernel/xam/nui_data_store.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_private.h"
+#include "xenia/kernel/xthread.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_usb_kinect.h"
 #include "xenia/xbox.h"
 
 DECLARE_bool(kinect_id);
+
+DEFINE_bool(kinect_tilt_callback_angle, false,
+            "Experimental: when a title registers its tilt callback "
+            "(XamNuiCameraTiltSetCallback), call it with message 0x2B00B and "
+            "the Kinect's current angle, as a console tells titles the "
+            "angle the Kinect was tuned to (Kinect Adventures' NUI runtime "
+            "stores it as its preferred angle; on a console it got 10).",
+            "Kernel");
 
 DEFINE_bool(kinect_remember_floor, true,
             "Kinect: keep the floor titles' NUI runtime remembers "
@@ -198,6 +207,26 @@ DECLARE_XAM_EXPORT1(XamNuiSkeletonGetBestSkeletonIndex, kNone, kStub);
 */
 dword_result_t XamNuiCameraTiltSetCallback_entry(dword_t callback) {
   kernel_state()->nui()->SetTiltCallback(callback);
+  XELOGI("XamNuiCameraTiltSetCallback({:08X})", uint32_t(callback));
+  if (cvars::kinect_tilt_callback_angle && callback) {
+    // The callback takes (message, parameters); for 0x2B00B the parameters
+    // are the angle in degrees as a 32-bit integer.
+    int32_t angle = 0;
+    bool moving = false;
+    xboxkrnl::KinectBridgeTiltStatus(&angle, &moving);
+    auto memory = kernel_state()->memory();
+    const uint32_t parameters = memory->SystemHeapAlloc(4);
+    if (parameters) {
+      xe::store_and_swap<int32_t>(memory->TranslateVirtual(parameters), angle);
+      uint64_t args[] = {0x0002B00B, parameters};
+      const uint64_t result = kernel_state()->processor()->Execute(
+          XThread::GetCurrentThread()->thread_state(), callback, args, 2);
+      XELOGI("Kinect: told the title's tilt callback the Kinect is tuned to "
+             "{} degrees (message 0x2B00B) -> {:08X}",
+             angle, uint32_t(result));
+      memory->SystemHeapFree(parameters);
+    }
+  }
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamNuiCameraTiltSetCallback, kNone, kStub);

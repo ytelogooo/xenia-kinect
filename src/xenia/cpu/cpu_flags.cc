@@ -69,7 +69,9 @@ DEFINE_string(probe_thread_ids, "",
 DEFINE_uint32(probe_log_limit, 0,
               "Log every --probe_guest_addresses hit, up to this many lines, "
               "with r3-r8 and the 64-bit values r5 and r6 point at when they "
-              "point into a stack (0 = only the first hits and every 300th).",
+              "point into a stack (0 = only the first hits and every 300th). "
+              "With --probe_dump, a hit is logged only when that memory "
+              "changed, with the rows that changed.",
               "CPU");
 DEFINE_string(probe_dump, "",
               "ADDRESS:LENGTH (hex). Each logged --probe_guest_addresses hit "

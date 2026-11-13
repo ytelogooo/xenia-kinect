@@ -26,6 +26,13 @@ Start Kinect Adventures on the console (Kinect plugged in), then right away:
     python probe_ka_tilt.py --ip 192.168.1.91 --seconds 90 --out ka-console-tilt.txt
 
 and stand where you normally play until you are past the player square.
+
+To compare "calibrate" with Xenia (where the tracker loses you as calibration
+starts and the auto-tilt then hunts up and down), sample faster and also log
+the title's own skeleton tracker as it changes, then pick calibrate and stand
+still until the Kinect settles:
+
+    python probe_ka_tilt.py --ip 192.168.1.91 --seconds 60 --interval 0.05 --skeleton --out ka-console-calibrate.txt
 """
 
 import argparse
@@ -46,6 +53,12 @@ KA_STATE = 0x83898E10
 KA_STATE_SIZE = 0x200
 KA_CHECK_ADDRESS = 0x82D2CD48
 KA_CHECK_BYTES = bytes.fromhex("3d40838a3d6058743bea8e10616b5373")
+# Its skeleton tracker's frame (NUI_SKELETON_FRAME as the title gets it):
+# +0x08 frame number, +0x10 floor clip plane, then 6 skeletons of 0x1C0
+# bytes from +0x30: +0x00 tracking state (2 tracked, 1 position only),
+# +0x04 tracking ID, +0x10 position (x, y, z, w) in metres.
+KA_SKELETON_FRAME = 0x83AD1C90
+KA_SKELETON_FRAME_SIZE = 0x30 + 6 * 0x1C0
 
 
 def be32(data, offset):
@@ -89,6 +102,37 @@ def decode_state(data):
         f"+0x1D0 {be32(data, 0x1D0):08X}",
     ]
     return "; ".join(fields) + "; status: " + decode_tilt_status(data, 0x150)
+
+
+def decode_skeletons(data):
+    """The tracker's frame: who is tracked or seen, and where."""
+    people = []
+    for i in range(6):
+        base = 0x30 + i * 0x1C0
+        state = be32(data, base)
+        if state not in (1, 2):
+            continue
+        x, y, z = (bef(data, base + 0x10 + 4 * k) for k in range(3))
+        people.append(f"slot {i} {'tracked' if state == 2 else 'seen'} "
+                      f"id {be32(data, base + 4)} at ({x:.2f}, {y:.2f}, "
+                      f"{z:.2f}) m")
+    plane = [bef(data, 0x10 + 4 * k) for k in range(4)]
+    return (f"frame {be32(data, 8)}: "
+            f"{'; '.join(people) if people else 'nobody'}; floor clip plane "
+            f"[{', '.join(f'{v:.3f}' for v in plane)}]")
+
+
+def skeleton_key(data):
+    """What counts as a change: who is in which state, positions to 10 cm."""
+    key = []
+    for i in range(6):
+        base = 0x30 + i * 0x1C0
+        state = be32(data, base)
+        key.append(state)
+        if state in (1, 2):
+            key.extend(round(bef(data, base + 0x10 + 4 * k), 1)
+                       for k in range(3))
+    return tuple(key)
 
 
 def xam_calls(console, out):
@@ -161,6 +205,9 @@ def main():
     parser.add_argument("--watch-xam", action="store_true",
                         help="only watch XamNuiCameraTiltGetStatus (works at "
                              "the dashboard)")
+    parser.add_argument("--skeleton", action="store_true",
+                        help="also log the title's skeleton tracker frame "
+                             "whenever who is seen or where changes")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -195,6 +242,7 @@ def main():
             out(f"== Kinect Adventures auto-tilt block at 0x{KA_STATE:08X}, "
                 f"written on change")
             previous = None
+            previous_skeletons = None
             start = time.monotonic()
             while time.monotonic() - start < args.seconds:
                 t = int((time.monotonic() - start) * 1000)
@@ -203,6 +251,13 @@ def main():
                     out(f"t={t} {decode_state(data)}")
                     f.write(f"t={t} raw {data.hex().upper()}\n")
                     previous = data
+                if args.skeleton:
+                    frame = console.get_memory(KA_SKELETON_FRAME,
+                                               KA_SKELETON_FRAME_SIZE)
+                    key = skeleton_key(frame)
+                    if key != previous_skeletons:
+                        out(f"t={t} tracker {decode_skeletons(frame)}")
+                        previous_skeletons = key
                 time.sleep(args.interval)
 
         if not args.no_calls:

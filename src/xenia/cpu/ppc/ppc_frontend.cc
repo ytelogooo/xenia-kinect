@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 #include "xenia/cpu/cpu_flags.h"
@@ -125,7 +126,44 @@ void ProbeHandler(PPCContext* ppc_context, void* arg0, void* arg1) {
           threads.end()) {
     return;
   }
+  static const std::pair<uint32_t, uint32_t> dump = [] {
+    const auto parts = xe::utf8::split(cvars::probe_dump, ":");
+    if (parts.size() != 2) {
+      return std::pair<uint32_t, uint32_t>(0, 0);
+    }
+    const uint32_t addr =
+        uint32_t(std::strtoul(std::string(parts[0]).c_str(), nullptr, 16));
+    const uint32_t len =
+        uint32_t(std::strtoul(std::string(parts[1]).c_str(), nullptr, 16));
+    return std::pair<uint32_t, uint32_t>(addr, std::min(len, 0x1000u));
+  }();
   if (cvars::probe_log_limit) {
+    // With a dump, a hit is logged only when the dumped memory changed since
+    // that probe's last logged hit, and only the 32-byte rows that changed.
+    std::string changed_rows;
+    if (dump.first && dump.second) {
+      static std::mutex dump_mutex;
+      static std::unordered_map<uint32_t, std::vector<uint8_t>> last_dumps;
+      const uint8_t* bytes = ppc_context->TranslateVirtual(dump.first);
+      std::lock_guard<std::mutex> lock(dump_mutex);
+      std::vector<uint8_t>& last = last_dumps[address];
+      const bool first = last.empty();
+      if (!first && std::memcmp(last.data(), bytes, dump.second) == 0) {
+        return;
+      }
+      for (uint32_t row = 0; row < dump.second; row += 32) {
+        const uint32_t row_length = std::min(32u, dump.second - row);
+        if (!first &&
+            std::memcmp(last.data() + row, bytes + row, row_length) == 0) {
+          continue;
+        }
+        changed_rows += fmt::format("\n  dump {:08X}:", dump.first + row);
+        for (uint32_t i = 0; i < row_length; ++i) {
+          changed_rows += fmt::format(" {:02X}", bytes[row + i]);
+        }
+      }
+      last.assign(bytes, bytes + dump.second);
+    }
     static std::atomic<uint32_t> logged{0};
     if (logged.fetch_add(1) >= cvars::probe_log_limit) {
       return;
@@ -147,6 +185,9 @@ void ProbeHandler(PPCContext* ppc_context, void* arg0, void* arg1) {
         uint32_t(ppc_context->r[6]), uint32_t(ppc_context->r[7]),
         uint32_t(ppc_context->r[8]), stack_value(ppc_context->r[5]),
         stack_value(ppc_context->r[6]), uint32_t(ppc_context->lr));
+    if (!changed_rows.empty()) {
+      XELOGI("probe {:08X} memory:{}", address, changed_rows);
+    }
     return;
   }
   if (count <= 5 || count % 300 == 0) {
@@ -155,17 +196,6 @@ void ProbeHandler(PPCContext* ppc_context, void* arg0, void* arg1) {
            address, count, uint32_t(ppc_context->r[3]),
            uint32_t(ppc_context->r[4]), uint32_t(ppc_context->r[5]),
            uint32_t(ppc_context->r[6]), uint32_t(ppc_context->lr));
-    static const std::pair<uint32_t, uint32_t> dump = [] {
-      const auto parts = xe::utf8::split(cvars::probe_dump, ":");
-      if (parts.size() != 2) {
-        return std::pair<uint32_t, uint32_t>(0, 0);
-      }
-      const uint32_t addr = uint32_t(
-          std::strtoul(std::string(parts[0]).c_str(), nullptr, 16));
-      const uint32_t len = uint32_t(
-          std::strtoul(std::string(parts[1]).c_str(), nullptr, 16));
-      return std::pair<uint32_t, uint32_t>(addr, std::min(len, 0x1000u));
-    }();
     if (dump.first && dump.second) {
       const uint8_t* bytes = ppc_context->TranslateVirtual(dump.first);
       std::string line;
