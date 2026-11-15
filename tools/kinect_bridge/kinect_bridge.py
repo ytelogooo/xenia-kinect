@@ -8,6 +8,11 @@ Xenia over UDP (enable it there with kinect_skeleton_udp_port = 27050).
     python kinect_bridge.py --list            # find your camera's index
     python kinect_bridge.py --camera 1        # run (press Q in the preview)
 
+It also sends the camera picture (XKCL packets), lined up with the skeleton
+the way a Kinect's colour camera is, for the games' player pictures, face
+squares and recordings (Kinect Sports' Show Off & Share, Just Dance 4's
+Autodance).
+
 Coordinates sent are Kinect skeleton space in metres: +x = the sensor's left
 (the player's right when facing it), +y up, +z away from the sensor, with the
 emulated sensor 0.8 m above the floor.
@@ -19,6 +24,7 @@ import os
 import socket
 import struct
 import sys
+import threading
 import time
 import urllib.request
 
@@ -251,6 +257,149 @@ def place_on_floor(joints, world, calib, now):
     joints[:, 1] += (standing_hip + jump) - raw
 
 
+# The Kinect's 640x480 colour camera: focal length in pixels. The picture is
+# sent as if taken by it, so Xenia (and the games) find the player where the
+# skeleton says, using the Kinect's own skeleton-to-colour mapping.
+KINECT_COLOUR_FOCAL = 531.15
+COLOUR_WIDTH, COLOUR_HEIGHT = 640, 480
+COLOUR_ROWS_PER_PACKET = 16
+
+
+class ColourSender:
+    """Sends the camera picture to Xenia, as the Kinect SDK bridge does.
+
+    XKCL v1: "XKCL", u32 version 1, u32 frame, u16 width, u16 height,
+    u16 first row, u16 rows, then rows * width * 3 bytes (B, G, R).
+    XKFO v1 (twice a second): "XKFO", u32 version 1, u32 flags (1 = whole
+    picture), f32 face offset in metres.
+    From Xenia, XKCM v1: "XKCM", u32 version 1, u32 flags (1 = the game
+    wants the whole picture for the next 3 s, it crops the faces itself).
+    Little-endian.
+    """
+
+    def __init__(self, sock, target, args):
+        self.sock = sock
+        self.target = target
+        self.face_crop = not args.no_face_crop
+        self.face_size = args.face_size
+        self.face_offset = args.face_offset
+        self.flip = not args.colour_no_flip
+        self.every = max(1, args.colour_every)
+        self.counter = 0
+        self.frame_number = 0
+        self.whole_until = 0.0
+        self.last_settings = 0.0
+        self.dy = None  # vertical shift lining the picture up with the skeleton
+        self.crop = None
+        threading.Thread(target=self.receive, daemon=True).start()
+
+    def receive(self):
+        while True:
+            try:
+                p, _ = self.sock.recvfrom(2048)
+            except OSError:
+                time.sleep(0.2)
+                continue
+            if len(p) >= 12 and p[:4] == b"XKCM" and \
+                    struct.unpack_from("<I", p, 4)[0] == 1:
+                whole = struct.unpack_from("<I", p, 8)[0] & 1
+                was = self.wants_whole()
+                self.whole_until = time.monotonic() + 3.0 if whole else 0.0
+                if bool(whole) != was:
+                    self.send_settings()
+
+    def wants_whole(self):
+        return time.monotonic() < self.whole_until
+
+    def cropping(self):
+        return self.face_crop and not self.wants_whole()
+
+    def send_settings(self):
+        flags = 0 if self.face_crop else 1
+        try:
+            self.sock.sendto(struct.pack("<4sIIf", b"XKFO", 1, flags,
+                                         self.face_offset), self.target)
+        except OSError:
+            pass
+        self.last_settings = time.monotonic()
+
+    def picture(self, frame, fx, head_px, head):
+        """The camera frame as the Kinect's colour camera would see it.
+
+        head_px: the head's (x, y) in the camera frame; head: its Kinect
+        skeleton position. Horizontally the skeleton comes from the picture
+        (+x = the sensor's left, shown on the right as in a Kinect's
+        picture); vertically it is moved to stand on the emulated floor, so
+        the picture is moved to match.
+        """
+        height, width = frame.shape[:2]
+        k = KINECT_COLOUR_FOCAL / fx
+        sx = -k if self.flip else k
+        if head_px is not None and head is not None and head[2] > 0.3:
+            target_y = (COLOUR_HEIGHT / 2 -
+                        head[1] * KINECT_COLOUR_FOCAL / head[2])
+            dy = target_y - (COLOUR_HEIGHT / 2 + (head_px[1] - height / 2) * k)
+            self.dy = dy if self.dy is None else lerp(self.dy, dy, 0.1)
+        dy = self.dy or 0.0
+        m = np.float32([
+            [sx, 0, COLOUR_WIDTH / 2 - sx * width / 2],
+            [0, k, COLOUR_HEIGHT / 2 - k * height / 2 + dy]])
+        return cv2.warpAffine(frame, m, (COLOUR_WIDTH, COLOUR_HEIGHT),
+                              flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT)
+
+    def face(self, picture, head):
+        """A square around the head stretched to 640x480, as the SDK bridge
+        sends it (the games squeeze it back into their square slots)."""
+        if head is None or head[2] < 0.5:
+            self.crop = None
+            return picture
+        f = KINECT_COLOUR_FOCAL
+        x = COLOUR_WIDTH / 2 + head[0] * f / head[2]
+        y = COLOUR_HEIGHT / 2 - head[1] * f / head[2] + \
+            self.face_offset * f / head[2]
+        side = min(max(self.face_size * f / head[2], 64.0), COLOUR_HEIGHT)
+        if self.crop is None:
+            self.crop = [x, y, side]
+        else:
+            self.crop = [lerp(a, b, 0.4) for a, b in zip(self.crop, (x, y, side))]
+        x, y, side = self.crop
+        x0 = min(max(x - side / 2, 0), COLOUR_WIDTH - side)
+        y0 = min(max(y - side / 2, 0), COLOUR_HEIGHT - side)
+        sx = side / COLOUR_WIDTH
+        sy = side / COLOUR_HEIGHT
+        m = np.float32([[sx, 0, x0], [0, sy, y0]])
+        return cv2.warpAffine(picture, m, (COLOUR_WIDTH, COLOUR_HEIGHT),
+                              flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+
+    def send(self, frame, fx, head_px, head):
+        now = time.monotonic()
+        if now - self.last_settings >= 0.5:
+            self.send_settings()
+        # Line up every frame (the vertical shift follows the player), send
+        # every Nth.
+        picture = self.picture(frame, fx, head_px, head)
+        self.counter += 1
+        if self.counter < self.every:
+            return picture
+        self.counter = 0
+        sent = self.face(picture, head) if self.cropping() else picture
+        self.frame_number = (self.frame_number + 1) & 0xFFFFFFFF
+        data = np.ascontiguousarray(sent).tobytes()
+        row_bytes = COLOUR_WIDTH * 3
+        for first in range(0, COLOUR_HEIGHT, COLOUR_ROWS_PER_PACKET):
+            rows = min(COLOUR_ROWS_PER_PACKET, COLOUR_HEIGHT - first)
+            header = struct.pack("<4sIIHHHH", b"XKCL", 1, self.frame_number,
+                                 COLOUR_WIDTH, COLOUR_HEIGHT, first, rows)
+            try:
+                self.sock.sendto(header + data[first * row_bytes:
+                                               (first + rows) * row_bytes],
+                                 self.target)
+            except OSError:
+                pass
+        return picture
+
+
 def make_packet(sequence, joints, states):
     tracked = joints is not None
     if not tracked:
@@ -293,6 +442,23 @@ def main():
     parser.add_argument("--hold", type=float, default=0.5,
                         help="seconds to keep the last skeleton when tracking "
                              "drops out (default 0.5)")
+    parser.add_argument("--no-colour", action="store_true",
+                        help="don't send the camera picture")
+    parser.add_argument("--colour-every", type=int, default=1,
+                        help="send every Nth camera picture (default 1)")
+    parser.add_argument("--colour-no-flip", action="store_true",
+                        help="send the picture as the camera sees it instead "
+                             "of mirrored like a Kinect's (F in the preview "
+                             "toggles it)")
+    parser.add_argument("--no-face-crop", action="store_true",
+                        help="always send the whole picture, never a square "
+                             "around the face")
+    parser.add_argument("--face-size", type=float, default=0.30,
+                        help="width of the face square in metres "
+                             "(default 0.30; X/Z in the preview)")
+    parser.add_argument("--face-offset", type=float, default=0.08,
+                        help="move the face square down (metres, default "
+                             "0.08; W/S in the preview)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=27050)
     parser.add_argument("--no-preview", action="store_true")
@@ -318,7 +484,9 @@ def main():
         sys.exit(f"Could not open camera {args.camera}; try --list.")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", 0))  # Xenia answers to this address (XKCM)
     target = (args.host, args.port)
+    colour = None if args.no_colour else ColourSender(sock, target, args)
     state = {"alpha": min(max(args.smoothing, 0.05), 1.0),
              "push_gain": max(args.push_gain, 1.0)}
     calib = {}
@@ -337,6 +505,9 @@ def main():
             break
         if args.mirror:
             frame = cv2.flip(frame, 1)
+        camera_frame = frame
+        if not args.no_preview:
+            frame = frame.copy()  # the preview draws on this one
         height, width = frame.shape[:2]
         fx = (width / 2) / math.tan(math.radians(args.hfov) / 2)
 
@@ -348,8 +519,11 @@ def main():
             mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ts)
 
         joints = states = None
+        head_px = None
         if result.pose_world_landmarks:
             image_lm = result.pose_landmarks[0]
+            head_px = ((image_lm[L_EAR].x + image_lm[R_EAR].x) / 2 * width,
+                       (image_lm[L_EAR].y + image_lm[R_EAR].y) / 2 * height)
             visibility = [p.visibility for p in image_lm]
             converted = to_kinect(result.pose_world_landmarks[0], image_lm,
                                   visibility, width, height, fx,
@@ -388,6 +562,10 @@ def main():
             joints, states = last_good[1], last_good[2]
         sock.sendto(make_packet(sequence, joints, states), target)
         sequence += 1
+        if colour is not None:
+            tracked_now = joints is not None and head_px is not None
+            colour.send(camera_frame, fx, head_px if tracked_now else None,
+                        joints[3] if tracked_now else None)
 
         fps_frames += 1
         now = time.monotonic()
@@ -408,10 +586,30 @@ def main():
                 color = (0, 0, 255)
             cv2.putText(frame, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                         color, 2)
+            if colour is not None:
+                mode = ("whole picture (the game's)" if not colour.cropping()
+                        else "face square")
+                info = (f"picture: {mode}{', mirrored' if colour.flip else ''}"
+                        f"  face size {colour.face_size:.2f} m (X/Z)  "
+                        f"offset {colour.face_offset:+.2f} m (W/S)  F flips")
+                cv2.putText(frame, info, (20, height - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             cv2.imshow("Kinect bridge (Q to quit)", frame)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), ord("Q")):
                 break
+            if colour is not None:
+                if key in (ord("w"), ord("W"), ord("s"), ord("S")):
+                    step = 0.01 if key in (ord("w"), ord("W")) else -0.01
+                    colour.face_offset = min(max(colour.face_offset + step,
+                                                 -0.3), 0.3)
+                    colour.send_settings()
+                elif key in (ord("x"), ord("X"), ord("z"), ord("Z")):
+                    step = 0.02 if key in (ord("x"), ord("X")) else -0.02
+                    colour.face_size = min(max(colour.face_size + step,
+                                               0.15), 1.0)
+                elif key in (ord("f"), ord("F")):
+                    colour.flip = not colour.flip
 
     cap.release()
     cv2.destroyAllWindows()

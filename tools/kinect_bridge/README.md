@@ -30,3 +30,16 @@ Useful options: `--hfov` (camera field of view, fixes distance estimates),
 
 Stand so your whole body, head to feet, is in the picture, about 2–3 m from
 the camera, in a well-lit room.
+
+## Camera picture
+
+The bridge also sends the camera picture, as the Kinect SDK bridge does, for
+the games' player pictures, face squares and recordings (Kinect Sports'
+Show Off & Share, Just Dance 4's Autodance; that one also needs
+`readback_memexport = true`). It is lined up with the skeleton the way a
+Kinect's colour camera is, so `--hfov` should match your camera.
+
+In the preview: W/S move the face square down/up, X/Z make it bigger/smaller,
+F flips the picture left/right if the games show you on the wrong side.
+`--no-colour` turns the picture off, `--colour-every 2` sends every second
+one, `--no-face-crop` always sends the whole picture.

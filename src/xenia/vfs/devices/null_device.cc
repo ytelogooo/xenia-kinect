@@ -9,6 +9,7 @@
 
 #include "xenia/vfs/devices/null_device.h"
 
+#include <atomic>
 #include <cctype>
 
 #include "xenia/base/filesystem.h"
@@ -80,6 +81,14 @@ std::string VolumeOf(const std::string& path) {
   return volume;
 }
 }  // namespace
+
+namespace {
+std::atomic<bool> format_tracking{false};
+}  // namespace
+
+void NullDevice::SetFormatTracking(bool on) { format_tracking = on; }
+
+bool NullDevice::FormatTracking() { return format_tracking.load(); }
 
 void NullDevice::NoteFatxFormat(const std::string& volume,
                                 uint32_t sectors_per_cluster) {

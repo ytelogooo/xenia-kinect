@@ -1642,6 +1642,7 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   }
 
   // Reset state.
+  vfs::NullDevice::SetFormatTracking(false);
   title_id_ = std::nullopt;
   title_name_ = "";
   title_version_ = "";
@@ -1725,6 +1726,10 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
           kernel_state_->xconfig()->ReadSetting<uint32_t>(
               kernel::XCONFIG_USER_CATEGORY, kernel::XCONFIG_USER_LANGUAGE)));
       XELOGI("Title name: {}", title_name_);
+      if (title_name_.find("Just Dance") != std::string::npos) {
+        vfs::NullDevice::SetFormatTracking(true);
+        XELOGI("NullDevice: keeping track of cache partition formats");
+      }
 
       // Show achievments data
       tabulate::Table table;

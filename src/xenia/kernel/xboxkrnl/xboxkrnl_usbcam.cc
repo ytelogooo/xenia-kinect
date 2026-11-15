@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "xenia/base/byte_order.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/utf8.h"
@@ -143,6 +144,12 @@ DEFINE_int32(kinect_jd4_hand_flag, -1,
              "per-hand flag with this value before the skeleton filter reads "
              "it (0 = treat both hands as reliable). -1 = leave it.",
              "Kernel");
+DEFINE_bool(kinect_jd4_camera_face, true,
+            "Just Dance 4 with a Kinect bridge: give the game the bridge's "
+            "whole camera picture, framed the way it asks, and let it crop "
+            "the player face squares itself, as with a real Kinect. Off: the "
+            "bridge's face crop (the old way, which the game crops again).",
+            "Kernel");
 DEFINE_bool(kinect_jd4_skeleton_hands, true,
             "Just Dance 4 with a Kinect bridge: give its skeleton filter the "
             "hands from the skeleton frame, marked reliable, instead of its "
@@ -162,7 +169,7 @@ DEFINE_string(kinect_jd2014_colour_mapping, "nominal",
               "Both log what the runtime returned now and then.",
               "Kernel");
 DEFINE_string(kinect_jd_colour_mapping, "auto",
-              "Just Dance 2015 and 2017 crop each player's face for the "
+              "Just Dance 4, 2015 and 2017 crop each player's face for the "
               "player slots themselves, from where "
               "NuiImageGetColorPixelCoordinatesFromDepthPixel puts the head "
               "in the colour image; with Xenia's guessed camera calibration "
@@ -836,8 +843,11 @@ class SkeletonReceiver {
 
   // Latest colour image (B, G, R per pixel, top row first) if it is newer than
   // max_age_s. The image is shared, not copied.
+  // sequence (optional): counts the pictures received, to tell a new one
+  // from the last one again.
   bool LatestColour(std::shared_ptr<const std::vector<uint8_t>>* bgr,
-                    uint32_t* width, uint32_t* height, double max_age_s) {
+                    uint32_t* width, uint32_t* height, double max_age_s,
+                    uint32_t* sequence = nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!colour_ ||
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
@@ -848,7 +858,20 @@ class SkeletonReceiver {
     *bgr = colour_;
     *width = colour_width_;
     *height = colour_height_;
+    if (sequence) {
+      *sequence = colour_sequence_;
+    }
     return true;
+  }
+
+  // Camera pictures since the last call: complete ones, ones published with
+  // rows missing (lost packets: those rows keep the picture before's), and
+  // ones dropped because their last rows never came.
+  void TakeColourStats(uint32_t* complete, uint32_t* partial,
+                       uint32_t* dropped) {
+    *complete = colour_complete_.exchange(0);
+    *partial = colour_partial_.exchange(0);
+    *dropped = colour_dropped_.exchange(0);
   }
 
   // Asks the Kinect SDK bridge to tilt the sensor to angle_deg (relative to
@@ -949,6 +972,16 @@ class SkeletonReceiver {
         n < 20 + int(rows) * int(width) * 3) {
       return;
     }
+    uint32_t frame;
+    std::memcpy(&frame, packet + 8, 4);
+    if (frame != pending_colour_frame_) {
+      if (pending_colour_rows_) {
+        ++colour_dropped_;  // the previous picture's last rows never came
+      }
+      pending_colour_frame_ = frame;
+      pending_colour_rows_ = 0;
+    }
+    pending_colour_rows_ += rows;
     const size_t row_bytes = size_t(width) * 3;
     if (pending_colour_.size() != row_bytes * height) {
       pending_colour_.assign(row_bytes * height, 0);
@@ -958,9 +991,12 @@ class SkeletonReceiver {
     if (uint32_t(first) + rows != height) {
       return;  // published with the last rows of the frame
     }
+    ++(pending_colour_rows_ >= height ? colour_complete_ : colour_partial_);
+    pending_colour_rows_ = 0;
     std::shared_ptr<const std::vector<uint8_t>> colour =
         std::make_shared<std::vector<uint8_t>>(pending_colour_);
     std::lock_guard<std::mutex> lock(mutex_);
+    ++colour_sequence_;
     colour_ = std::move(colour);
     colour_width_ = width;
     colour_height_ = height;
@@ -1267,6 +1303,12 @@ class SkeletonReceiver {
   uint32_t colour_height_ = 0;
   std::chrono::steady_clock::time_point colour_received_;
   bool logged_first_colour_ = false;
+  uint32_t colour_sequence_ = 0;
+  uint32_t pending_colour_frame_ = 0;  // receive thread only
+  uint32_t pending_colour_rows_ = 0;   // receive thread only
+  std::atomic<uint32_t> colour_complete_{0};
+  std::atomic<uint32_t> colour_partial_{0};
+  std::atomic<uint32_t> colour_dropped_{0};
 #ifdef XE_PLATFORM_WIN32
   SOCKET socket_ = INVALID_SOCKET;
 #else
@@ -1330,13 +1372,28 @@ void NoteFaceColourUse() {
   }
 }
 
+// Just Dance 4 with kinect_jd4_camera_face: its face squares come from the
+// emulated colour stream like from a real Kinect. The game's camera runtime
+// pans a window of the sensor onto the player's face (colour settings, request
+// 0x23) and the game crops the face out of that; given the bridge's face crop
+// instead, it cropped the crop again.
+bool Jd4CameraFace() {
+  static const bool jd4 =
+      kernel_state()->emulator()->title_name().find("Just Dance 4") !=
+      std::string::npos;
+  return jd4 && cvars::kinect_jd4_camera_face;
+}
+
 // Called for each emulated colour frame.
 void RequestWholeColourIfUnused() {
   // Just Dance titles show the player's face from the colour stream even
   // without one of the face hooks (Just Dance 2016): keep the bridge's crop.
+  // Just Dance 4 frames its faces from the camera picture itself
+  // (kinect_jd4_camera_face).
   static const bool just_dance =
       kernel_state()->emulator()->title_name().find("Just Dance") !=
-      std::string::npos;
+          std::string::npos &&
+      !Jd4CameraFace();
   if (just_dance) {
     return;
   }
@@ -1361,8 +1418,12 @@ void RequestWholeColourIfUnused() {
 // from it like from a real Kinect - every title gets a real picture (Kinect
 // Sports' Show Off & Share videos, photos), without a hook of its own. 8-bit
 // buffers (0x4B000) get Bayer GRBG, 16-bit ones (0x96000) YUV 4:2:2 (UYVY).
+// With a window (colour settings +0x24 = 1), the frame is the quarter of the
+// picture centred window_x / window_y full-resolution pixels from its centre,
+// at twice the size, like a real Kinect's (usb_kinect's ViewColorFrame).
 // Returns the bytes written, 0 without a recent bridge picture.
-uint32_t WriteBridgeColourFrame(uint8_t* out, uint32_t size) {
+uint32_t WriteBridgeColourFrame(uint8_t* out, uint32_t size, bool window,
+                                int32_t window_x, int32_t window_y) {
   constexpr uint32_t kWidth = 640, kHeight = 480;
   constexpr uint32_t kBayerBytes = kWidth * kHeight;
   constexpr uint32_t kYuvBytes = kWidth * kHeight * 2;
@@ -1371,20 +1432,58 @@ uint32_t WriteBridgeColourFrame(uint8_t* out, uint32_t size) {
   }
   RequestWholeColourIfUnused();
   std::shared_ptr<const std::vector<uint8_t>> colour;
-  uint32_t colour_width, colour_height;
-  if (!SkeletonReceiver::Get().LatestColour(&colour, &colour_width,
-                                            &colour_height, 0.5) ||
-      !colour_width || !colour_height) {
+  uint32_t colour_width, colour_height, sequence = 0;
+  const bool have_colour = SkeletonReceiver::Get().LatestColour(
+      &colour, &colour_width, &colour_height, 0.5, &sequence);
+  // Every 5 s: how many camera pictures came from the bridge (and how many
+  // were incomplete), and how many of the game's colour frames had a new one
+  // (Just Dance 4's Autodance and Kinect Sports' replays record these).
+  {
+    static std::mutex stats_mutex;
+    static auto stats_start = std::chrono::steady_clock::now();
+    static uint32_t frames = 0, new_pictures = 0, last_sequence = 0;
+    std::lock_guard<std::mutex> lock(stats_mutex);
+    ++frames;
+    if (have_colour && sequence != last_sequence) {
+      ++new_pictures;
+      last_sequence = sequence;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds =
+        std::chrono::duration<double>(now - stats_start).count();
+    if (seconds >= 5.0) {
+      uint32_t complete, partial, dropped;
+      SkeletonReceiver::Get().TakeColourStats(&complete, &partial, &dropped);
+      XELOGI("NUI camera: bridge pictures {:.1f}/s ({:.1f}/s with lost rows, "
+             "{:.1f}/s dropped); game colour frames {:.1f}/s, {:.1f}/s of "
+             "them a new picture",
+             complete / seconds, partial / seconds, dropped / seconds,
+             frames / seconds, new_pictures / seconds);
+      stats_start = now;
+      frames = 0;
+      new_pictures = 0;
+    }
+  }
+  if (!have_colour || !colour_width || !colour_height) {
     return 0;
   }
   const bool mirror = cvars::kinect_live_colour_mirror;
   const uint8_t* in = colour->data();
+  // Position in the 640x480 picture of a frame pixel.
+  auto source = [window](uint32_t i, uint32_t frame_size, int32_t offset) {
+    if (!window) {
+      return i;
+    }
+    const float f = frame_size * 0.25f + offset * 0.5f + (i + 0.5f) * 0.5f;
+    return uint32_t(std::clamp(int(f), 0, int(frame_size) - 1));
+  };
   auto bgr_at = [&](uint32_t x, uint32_t y) {
-    uint32_t sx = x * colour_width / kWidth;
+    uint32_t sx = source(x, kWidth, window_x) * colour_width / kWidth;
     if (mirror) {
       sx = colour_width - 1 - sx;
     }
-    const uint32_t sy = y * colour_height / kHeight;
+    const uint32_t sy =
+        source(y, kHeight, window_y) * colour_height / kHeight;
     return in + (size_t(sy) * colour_width + sx) * 3;
   };
   if (size >= kYuvBytes) {
@@ -1507,8 +1606,25 @@ class EmulatedNuiCamera {
         // the current number (+0x2C of the read): left pending, every colour
         // frame was thrown away (Kinect Sports recorded nothing for its Show
         // Off & Share videos).
+        const bool window = xe::load_and_swap<uint32_t>(r + 0x24) == 1;
+        const int32_t window_x =
+            window ? xe::load_and_swap<int32_t>(r + 0x28) : 0;
+        const int32_t window_y =
+            window ? xe::load_and_swap<int32_t>(r + 0x2C) : 0;
+        const bool window_changed = window != colour_window_.load() ||
+                                    window_x != colour_window_x_.load() ||
+                                    window_y != colour_window_y_.load();
+        colour_window_x_ = window_x;
+        colour_window_y_ = window_y;
+        colour_window_ = window;
         const uint8_t generation = ++colour_generation_;
         xe::store_and_swap<uint32_t>(r + 0x18, generation);
+        static std::atomic<uint32_t> window_logged{0};
+        if (window_changed && window_logged.fetch_add(1) < 30) {
+          XELOGI("NUI camera: colour window {} (at {}, {}), settings #{}",
+                 window ? "on" : "off", window_x, window_y,
+                 uint32_t(generation));
+        }
         const uint32_t callback = xe::load_and_swap<uint32_t>(r + 0x14);
         if (callback && callback != 0xFFFFFFFF) {
           uint64_t args[] = {req, kStatusSuccess, 0};
@@ -1523,10 +1639,29 @@ class EmulatedNuiCamera {
         return kStatusSuccess;
       }
 
-      case 0x24:  // per-component state query: mode nibble at +0x1C and
-                  // four values at +0x4C; report all zero.
+      case 0x24: {
+        // Colour settings read-back, as the real-Kinect path answers it
+        // (usb_kinect kGetControls): flags whose low four bits mark the
+        // exposure values valid, the resolution, no window, the exposure's
+        // 16.16 limits, then gains and exposure time of 1.0. All zero read
+        // back as no exposure at all: Just Dance 4's own colour image (its
+        // face squares, Autodance videos) came out black.
         std::memset(r + 0x18, 0, 0x60 - 0x18);
+        xe::store_and_swap<uint32_t>(r + 0x1C, 0x8000000F);
+        xe::store_and_swap<uint32_t>(r + 0x20, 2);
+        xe::store_and_swap<uint32_t>(r + 0x3C, 0x1999);
+        xe::store_and_swap<uint32_t>(r + 0x40, 0x1999);
+        xe::store_and_swap<uint32_t>(r + 0x44, 0xCCCC);
+        xe::store_and_swap<uint32_t>(r + 0x48, 0xCCCC);
+        for (uint32_t offset = 0x4C; offset <= 0x58; offset += 4) {
+          xe::store_and_swap<uint32_t>(r + offset, 0x10000);
+        }
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+          XELOGI("NUI camera: colour settings read back (exposure 1.0)");
+        }
         return kStatusSuccess;
+      }
 
       default:
         XELOGW("NUI camera: unhandled request code {:02X} at {:08X}:{}",
@@ -1595,6 +1730,13 @@ class EmulatedNuiCamera {
     start = now;
     live_calls = emulated_calls = empty_calls = 0;
     pixel_sum = 0;
+  }
+
+  // The colour window the game last set (request 0x23).
+  void ColourWindow(bool* on, int32_t* x, int32_t* y) const {
+    *on = colour_window_.load();
+    *x = colour_window_x_.load();
+    *y = colour_window_y_.load();
   }
 
   // Frame timestamp in milliseconds (since the camera started streaming;
@@ -1789,8 +1931,10 @@ class EmulatedNuiCamera {
           }
         } else if (buffer && size) {
           bytes = stream == kStreamColour
-                      ? WriteBridgeColourFrame(memory->TranslateVirtual(buffer),
-                                               size)
+                      ? WriteBridgeColourFrame(
+                            memory->TranslateVirtual(buffer), size,
+                            colour_window_.load(), colour_window_x_.load(),
+                            colour_window_y_.load())
                       : 0;
           if (bytes) {
             static std::atomic<bool> logged{false};
@@ -1807,6 +1951,13 @@ class EmulatedNuiCamera {
         if (stream == kStreamColour) {
           r[0x2C] = colour_generation_.load();
         }
+        // The frame's sequence number and time (guest uptime in ms), set as
+        // the real-Kinect path sets them (usb_kinect): left at 0, Just Dance
+        // 4's runtime made nothing of the colour frames (black face squares
+        // and Autodance videos).
+        xe::store_and_swap<uint32_t>(r + 0x40, frame_number_);
+        xe::store_and_swap<uint64_t>(
+            r + 0x48, std::max<uint64_t>(Clock::QueryGuestUptimeMillis(), 1));
         if (info) {
           xe::store_and_swap<uint32_t>(memory->TranslateVirtual(info),
                                        frame_number_);
@@ -1825,6 +1976,10 @@ class EmulatedNuiCamera {
   std::atomic<uint32_t> state_{kCamStateNeedsSetup};
   // Number of the latest colour settings (request 0x23).
   std::atomic<uint8_t> colour_generation_{0};
+  // Its window of the sensor (request 0x23 +0x24..+0x2C).
+  std::atomic<bool> colour_window_{false};
+  std::atomic<int32_t> colour_window_x_{0};
+  std::atomic<int32_t> colour_window_y_{0};
   bool cancel_pending_ = false;
   object_ref<XHostThread> frame_thread_;
   uint32_t frame_number_ = 0;
@@ -2155,7 +2310,24 @@ void WriteColourImage(cpu::ppc::PPCContext_s* ctx, const PlayerImageHook& hook,
   if (!cvars::kinect_live_colour) {
     return;
   }
-  NoteFaceColourUse();
+  // Just Dance 4 (kinect_jd4_camera_face): the bridge's whole picture,
+  // framed by the camera window the game asks for, so the game crops the
+  // faces out of it as out of a real Kinect's. Its runtime makes this image
+  // from the camera's Bayer frames on the GPU (memexport), which reaches
+  // guest memory only with readback_memexport - otherwise it stays black.
+  const bool jd4_camera = Jd4CameraFace();
+  bool window = false;
+  int32_t window_x = 0, window_y = 0;
+  if (jd4_camera) {
+    EmulatedNuiCamera::Get().ColourWindow(&window, &window_x, &window_y);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+      XELOGI("NUI player image: Just Dance 4 gets the bridge's whole camera "
+             "picture, framed like the camera (kinect_jd4_camera_face)");
+    }
+  } else {
+    NoteFaceColourUse();
+  }
   std::shared_ptr<const std::vector<uint8_t>> colour;
   uint32_t colour_width, colour_height;
   if (!SkeletonReceiver::Get().LatestColour(&colour, &colour_width,
@@ -2177,11 +2349,19 @@ void WriteColourImage(cpu::ppc::PPCContext_s* ctx, const PlayerImageHook& hook,
   const bool mirror = cvars::kinect_live_colour_mirror;
   uint8_t* out = ctx->TranslateVirtual(buffer);
   const uint8_t* in = colour->data();
+  // Position in a 640x480 picture of a pixel of the camera window (see
+  // WriteBridgeColourFrame).
+  auto windowed = [window](uint32_t i, uint32_t size, int32_t offset) {
+    const float f = size * 0.25f + offset * 0.5f + (i + 0.5f) * 0.5f;
+    return window ? uint32_t(std::clamp(int(f), 0, int(size) - 1)) : i;
+  };
   for (uint32_t y = 0; y < rows; ++y) {
-    const uint32_t sy = y * colour_height / rows;
+    const uint32_t sy =
+        windowed(y * 480 / rows, 480, window_y) * colour_height / 480;
     const uint8_t* source_row = in + size_t(sy) * colour_width * 3;
     for (uint32_t x = 0; x < width; ++x) {
-      uint32_t sx = x * colour_width / width;
+      uint32_t sx =
+          windowed(x * 640 / width, 640, window_x) * colour_width / 640;
       if (mirror) {
         sx = colour_width - 1 - sx;
       }
@@ -3412,9 +3592,12 @@ void Jd4FilterDebugHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
 
 // kinect_jd4_skeleton_hands only applies to the bridges: with a real Kinect
 // the game's own hand tracker sees real images and works as on a console
-// (scoring felt better with it).
+// (scoring felt better with it). Decided while the game runs, as the camera
+// requests are (RealKinectAllowed): a running bridge takes the camera even
+// with allow_kinect_camera on, and then its hands are wanted.
 bool Jd4SkeletonHands() {
-  return cvars::kinect_jd4_skeleton_hands && !usb_kinect::IsActive();
+  return cvars::kinect_jd4_skeleton_hands &&
+         !(cvars::allow_kinect_camera && real_kinect_allowed.load() != 0);
 }
 
 // kinect_jd4_hand_flag: at 8298D254 / 8298D2A4 (lwz r6, 0x1DC / 0x25C(r11),
@@ -3467,8 +3650,10 @@ void Jd4HandFlagHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
     }
     return;
   }
-  xe::store_and_swap<uint32_t>(ctx->TranslateVirtual(field),
-                               uint32_t(cvars::kinect_jd4_hand_flag));
+  if (cvars::kinect_jd4_hand_flag >= 0) {
+    xe::store_and_swap<uint32_t>(ctx->TranslateVirtual(field),
+                                 uint32_t(cvars::kinect_jd4_hand_flag));
+  }
 }
 
 // Just Dance 2014: 82C51600 and 82C51888 map a joint into the colour image
@@ -3680,6 +3865,122 @@ void JdColourMappingHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
   }
 }
 
+// Just Dance 4: the face in each dancer-select slot (and on the score
+// screen) is the game's own crop of its colour image around where the
+// runtime's NuiImageGetColorPixelCoordinatesFromDepthPixel puts the head.
+// Two callers in each version; at the call r5 / r6 = depth pixel (320x240),
+// r7 = depth (mm << 3), r8 / r9 = where the colour X / Y go. One hook on the
+// call keeps those, one right after it replaces the answer like
+// JdColourMappingHook. With the bridge, the crop came from the top-left
+// corner of the picture.
+struct Jd4ColourMappingSite {
+  uint32_t call;
+  uint32_t mapper;
+};
+
+constexpr Jd4ColourMappingSite kJd4ColourMappingSites[] = {
+    {0x826C79A4, 0x82673D98},  // title update 1
+    {0x82835FBC, 0x82673D98},
+    {0x826C7434, 0x82673888},  // the game as on the disc
+    {0x828358CC, 0x82673888},
+};
+
+struct Jd4ColourMappingInput {
+  uint32_t call;
+  int32_t depth_x, depth_y;
+  uint32_t depth, colour_x, colour_y;
+};
+thread_local Jd4ColourMappingInput jd4_colour_mapping_input{};
+
+void Jd4ColourMappingHook(cpu::ppc::PPCContext_s* ctx, uint32_t address) {
+  constexpr size_t kSites = std::size(kJd4ColourMappingSites);
+  size_t index = 0;
+  while (index < kSites && kJd4ColourMappingSites[index].call != address &&
+         kJd4ColourMappingSites[index].call + 4 != address) {
+    ++index;
+  }
+  if (index == kSites || usb_kinect::IsActive() || !Jd4CameraFace()) {
+    return;
+  }
+  const Jd4ColourMappingSite& site = kJd4ColourMappingSites[index];
+  static std::atomic<int> status[kSites] = {};
+  std::atomic<int>& state = status[index];
+  if (state == 2) {
+    return;
+  }
+  if (state == 0) {
+    const uint32_t call =
+        xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(site.call));
+    const int32_t offset = int32_t(call << 6) >> 6 & ~3;
+    state = (call >> 26) == 18 && (call & 3) == 1 &&
+                    site.call + uint32_t(offset) == site.mapper
+                ? 1
+                : 2;
+    if (state == 2) {
+      return;  // the other version
+    }
+    XELOGI("Just Dance 4 colour mapping: hook at {:08X} active ({})",
+           site.call, cvars::kinect_jd_colour_mapping);
+  }
+  Jd4ColourMappingInput& input = jd4_colour_mapping_input;
+  if (address == site.call) {
+    input.call = site.call;
+    input.depth_x = int32_t(uint32_t(ctx->r[5]));
+    input.depth_y = int32_t(uint32_t(ctx->r[6]));
+    input.depth = uint32_t(ctx->r[7]) & 0xFFFF;
+    input.colour_x = uint32_t(ctx->r[8]);
+    input.colour_y = uint32_t(ctx->r[9]);
+    return;
+  }
+  if (input.call != site.call) {
+    return;
+  }
+  input.call = 0;
+  bool whole_image = false;
+  float bridge_offset = 0.0f;
+  const bool have_bridge =
+      cvars::kinect_skeleton_udp_port &&
+      SkeletonReceiver::Get().FaceSettings(&whole_image, &bridge_offset, 3.0);
+  const std::string& mode = cvars::kinect_jd_colour_mapping;
+  const bool use_nominal =
+      mode == "nominal" || (mode == "auto" && have_bridge && whole_image);
+  const double offset_m =
+      have_bridge ? double(bridge_offset) : cvars::kinect_jd_face_offset_m;
+  const int32_t result = int32_t(uint32_t(ctx->r[3]));
+  const uint32_t mm = input.depth >> 3;
+  const int32_t runtime_x = int32_t(
+      xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(input.colour_x)));
+  const int32_t runtime_y = int32_t(
+      xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(input.colour_y)));
+  const bool apply = use_nominal && mm > 300 && mm < 10000 &&
+                     input.depth_x >= -320 && input.depth_x <= 640 &&
+                     input.depth_y >= -240 && input.depth_y <= 480;
+  // Nominal Kinect v1 intrinsics, as for Just Dance 2014, moved down by the
+  // face offset at the point's distance.
+  constexpr double kScale = 531.15 / 285.63;
+  const double offset_px = mm > 300 ? 531.15 * offset_m / (mm * 0.001) : 0.0;
+  const int32_t mapped_x = int32_t(320.0 + (input.depth_x - 160) * kScale);
+  const int32_t mapped_y =
+      int32_t(240.0 + (input.depth_y - 120) * kScale + offset_px);
+  if (apply) {
+    xe::store_and_swap<uint32_t>(ctx->TranslateVirtual(input.colour_x),
+                                 uint32_t(mapped_x));
+    xe::store_and_swap<uint32_t>(ctx->TranslateVirtual(input.colour_y),
+                                 uint32_t(mapped_y));
+    ctx->r[3] = 0;
+  }
+  static std::atomic<uint32_t> calls[kSites] = {};
+  const uint32_t n = calls[index].fetch_add(1);
+  if (n < 10 || n % 900 == 0) {
+    XELOGI("Just Dance 4 colour mapping #{} at {:08X}: depth pixel ({}, {}) "
+           "{} mm -> runtime colour pixel ({}, {}) result {:08X}; nominal "
+           "({}, {}){}",
+           n, site.call, input.depth_x, input.depth_y, mm, runtime_x,
+           runtime_y, uint32_t(result), mapped_x, mapped_y,
+           apply ? " used" : "");
+  }
+}
+
 // jd4_debug_print: Just Dance 4's debug print (printf-style, format in r3,
 // arguments from r4) is a bare blr in the retail game; log the messages.
 // Only %s, %c and integer conversions are expanded (floats would be in the
@@ -3884,10 +4185,16 @@ void InstallTitleWorkarounds() {
   for (const JdColourMappingSite& site : kJdColourMappingSites) {
     cpu::ppc::RegisterGuestHook(site.address, JdColourMappingHook);
   }
+  for (const Jd4ColourMappingSite& site : kJd4ColourMappingSites) {
+    cpu::ppc::RegisterGuestHook(site.call, Jd4ColourMappingHook);
+    cpu::ppc::RegisterGuestHook(site.call + 4, Jd4ColourMappingHook);
+  }
   if (cvars::kinect_debug_jd4_filter) {
     cpu::ppc::RegisterGuestHook(0x8298D2EC, Jd4FilterDebugHook);
   }
-  if (cvars::kinect_jd4_hand_flag >= 0 || Jd4SkeletonHands()) {
+  // Installed at load, before the game opens the camera: whether the hands
+  // are the bridge's is decided in the hook (Jd4SkeletonHands).
+  if (cvars::kinect_jd4_hand_flag >= 0 || cvars::kinect_jd4_skeleton_hands) {
     for (uint32_t site : kJd4HandFlagSites) {
       cpu::ppc::RegisterGuestHook(site, Jd4HandFlagHook);
     }

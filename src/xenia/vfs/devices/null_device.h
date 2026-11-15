@@ -52,6 +52,13 @@ class NullDevice : public Device {
   // and then checks the volume reports that size; a 360 cache partition is
   // 2 GiB.
   void NoteFatxFormat(const std::string& volume, uint32_t sectors_per_cluster);
+
+  // Only for the titles that need it (Just Dance): Kinect Sports formats
+  // Cache1 too, and once the format "takes" it uses the partition itself,
+  // whose data a NullDevice doesn't keep, and crashes. Unformatted, it falls
+  // back to the cache:\ folder as before.
+  static void SetFormatTracking(bool on);
+  static bool FormatTracking();
   uint64_t TotalAllocationUnitsFor(const Entry* entry) const override;
   uint64_t AvailableAllocationUnitsFor(const Entry* entry) const override;
   uint32_t SectorsPerAllocationUnitFor(const Entry* entry) const override;

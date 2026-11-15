@@ -41,6 +41,9 @@ X_STATUS NullFile::WriteSync(std::span<const uint8_t> buffer,
     return X_STATUS_ACCESS_DENIED;
   }
 
+  if (!NullDevice::FormatTracking()) {
+    return X_STATUS_SUCCESS;
+  }
   // A FATX header ("XTAF", volume ID, sectors per cluster): the title is
   // formatting this cache partition and will check the cluster size.
   if (byte_offset == 0 && buffer.size() >= 12 &&
