@@ -18,6 +18,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Net;
@@ -246,6 +247,7 @@ class BridgeForm : Form {
   int colour_arrived_ = 0, colour_busy_ = 0, colour_sent_ = 0;
   double colour_in_rate_ = 0, colour_sent_rate_ = 0, colour_busy_rate_ = 0;
   string camera_text_ = "";
+  string timing_text_ = "";
 
   public BridgeForm(Options options) {
     options_ = options;
@@ -325,10 +327,20 @@ class BridgeForm : Form {
         sensor.ColorStream.Enable(ColorImageFormat.RgbResolution640x480Fps30);
         video_pixels_ = new byte[sensor.ColorStream.FramePixelDataLength];
         video_work_ = new byte[video_pixels_.Length];
-        sensor.ColorFrameReady += OnColourFrame;
       }
-      sensor.SkeletonFrameReady += OnSkeletonFrame;
-      sensor.DepthFrameReady += OnDepthFrame;
+      // The SDK raises each event on the thread that subscribed, through its
+      // SynchronizationContext; subscribed from a thread without one, it
+      // raises them on its own threads instead of the window's.
+      System.Threading.Thread subscriber =
+          new System.Threading.Thread(delegate() {
+            if (options_.SendColour) {
+              sensor.ColorFrameReady += OnColourFrame;
+            }
+            sensor.SkeletonFrameReady += OnSkeletonFrame;
+            sensor.DepthFrameReady += OnDepthFrame;
+          });
+      subscriber.Start();
+      subscriber.Join();
       sensor.Start();
       sensor_ = sensor;
       status_ = "Kinect running. Stand 2-3 m in front of it.";
@@ -346,7 +358,9 @@ class BridgeForm : Form {
       return;
     }
     KinectSensor sensor = sensor_;
-    sensor_ = null;
+    lock (frame_lock_) {  // not while a frame is being handled
+      sensor_ = null;
+    }
     sensor.SkeletonFrameReady -= OnSkeletonFrame;
     sensor.DepthFrameReady -= OnDepthFrame;
     sensor.ColorFrameReady -= OnColourFrame;
@@ -626,11 +640,95 @@ class BridgeForm : Form {
     return best;
   }
 
+  // Timed wrappers: how long the window's thread spends on each kind of
+  // frame (the SDK raises the events there, and drops frames it can't hand
+  // over in time), and how many frames the Kinect made (frame numbers).
+  long skeleton_ticks_ = 0, depth_ticks_ = 0, colour_ticks_ = 0,
+       paint_ticks_ = 0;
+  int last_skeleton_number_ = -1, last_colour_number_ = -1;
+  int skeleton_made_ = 0, colour_made_ = 0;
+
+  static void CountMade(int number, ref int last, ref int made) {
+    if (last >= 0 && number > last && number - last <= 30) {
+      made += number - last;
+    } else {
+      made += 1;
+    }
+    last = number;
+  }
+
+  // The Kinect frames are handled off the window's thread (see
+  // StartSensor): there they waited behind the drawing and the rest of the
+  // window, and the SDK dropped the frames it could not hand over in time
+  // (20-25 a second instead of 30 during Just Dance songs). One lock keeps
+  // the handlers and the drawing apart.
+  readonly object frame_lock_ = new object();
+  int redraw_pending_ = 0;
+
+  // Invalidate from any thread, at most one redraw queued at a time.
+  void RequestRedraw() {
+    if (!IsHandleCreated ||
+        System.Threading.Interlocked.Exchange(ref redraw_pending_, 1) != 0) {
+      return;
+    }
+    try {
+      BeginInvoke((MethodInvoker)delegate {
+        redraw_pending_ = 0;
+        Invalidate();
+      });
+    } catch (InvalidOperationException) {
+      redraw_pending_ = 0;
+    }
+  }
+
   void OnSkeletonFrame(object sender, SkeletonFrameReadyEventArgs e) {
+    lock (frame_lock_) {
+      if (sensor_ == null) {
+        return;  // stopped
+      }
+      long start = Stopwatch.GetTimestamp();
+      OnSkeletonFrameWork(e);
+      skeleton_ticks_ += Stopwatch.GetTimestamp() - start;
+    }
+  }
+
+  void OnDepthFrame(object sender, DepthImageFrameReadyEventArgs e) {
+    lock (frame_lock_) {
+      if (sensor_ == null) {
+        return;  // stopped
+      }
+      long start = Stopwatch.GetTimestamp();
+      OnDepthFrameWork(e);
+      depth_ticks_ += Stopwatch.GetTimestamp() - start;
+    }
+  }
+
+  void OnColourFrame(object sender, ColorImageFrameReadyEventArgs e) {
+    lock (frame_lock_) {
+      if (sensor_ == null) {
+        return;  // stopped
+      }
+      long start = Stopwatch.GetTimestamp();
+      OnColourFrameWork(e);
+      colour_ticks_ += Stopwatch.GetTimestamp() - start;
+    }
+  }
+
+  protected override void OnPaint(PaintEventArgs e) {
+    lock (frame_lock_) {
+      long start = Stopwatch.GetTimestamp();
+      PaintWork(e);
+      paint_ticks_ += Stopwatch.GetTimestamp() - start;
+    }
+  }
+
+  void OnSkeletonFrameWork(SkeletonFrameReadyEventArgs e) {
     using (SkeletonFrame frame = e.OpenSkeletonFrame()) {
       if (frame == null) {
         return;
       }
+      CountMade(frame.FrameNumber, ref last_skeleton_number_,
+                ref skeleton_made_);
       if (skeletons_.Length != frame.SkeletonArrayLength) {
         skeletons_ = new Skeleton[frame.SkeletonArrayLength];
       }
@@ -678,6 +776,22 @@ class BridgeForm : Form {
       } catch (Exception) {
         camera_text_ = "";
       }
+      double ms = 1000.0 / Stopwatch.Frequency / elapsed;
+      timing_text_ =
+          "  | the Kinect made: skeleton " +
+          (skeleton_made_ / elapsed).ToString("0", CultureInfo.InvariantCulture) +
+          ", camera " +
+          (colour_made_ / elapsed).ToString("0", CultureInfo.InvariantCulture) +
+          " frames/s | handling (ms per s): skeleton " +
+          (skeleton_ticks_ * ms).ToString("0", CultureInfo.InvariantCulture) +
+          ", depth " +
+          (depth_ticks_ * ms).ToString("0", CultureInfo.InvariantCulture) +
+          ", camera " +
+          (colour_ticks_ * ms).ToString("0", CultureInfo.InvariantCulture) +
+          ", drawing " +
+          (paint_ticks_ * ms).ToString("0", CultureInfo.InvariantCulture);
+      skeleton_made_ = colour_made_ = 0;
+      skeleton_ticks_ = depth_ticks_ = colour_ticks_ = paint_ticks_ = 0;
       if (options_.LogPath != null) {
         try {
           System.IO.File.AppendAllText(
@@ -697,7 +811,7 @@ class BridgeForm : Form {
                                              CultureInfo.InvariantCulture) +
                   " skipped (still sending)" +
                   (XeniaWantsWhole() ? "  whole picture" : "  face crop") +
-                  camera_text_ + Environment.NewLine);
+                  camera_text_ + timing_text_ + Environment.NewLine);
         } catch (Exception) {
         }
       }
@@ -715,7 +829,7 @@ class BridgeForm : Form {
       drawn_joints_ = null;
       if (options_.Players == 1 || people_ == 0) {
         SendNobody();
-        Invalidate();
+        RequestRedraw();
         return;
       }
     }
@@ -797,7 +911,7 @@ class BridgeForm : Form {
       udp_.Send(packet, packet.Length);
     } catch (SocketException) {
     }
-    Invalidate();
+    RequestRedraw();
   }
 
   // A point as sent to Xenia: levelled (Transform), x flipped with
@@ -1010,7 +1124,7 @@ class BridgeForm : Form {
     return new float[] {x, y, z};
   }
 
-  void OnDepthFrame(object sender, DepthImageFrameReadyEventArgs e) {
+  void OnDepthFrameWork(DepthImageFrameReadyEventArgs e) {
     using (DepthImageFrame frame = e.OpenDepthImageFrame()) {
       if (frame == null || frame.Width != DepthWidth ||
           frame.Height != DepthHeight) {
@@ -1052,7 +1166,7 @@ class BridgeForm : Form {
         PixelFormat.Format32bppRgb);
     Marshal.Copy(colour_pixels_, 0, data.Scan0, colour_pixels_.Length);
     depth_bitmap_.UnlockBits(data);
-    Invalidate();
+    RequestRedraw();
   }
 
   // Sends the camera image to Xenia as XKCL packets, so the games can show
@@ -1067,12 +1181,13 @@ class BridgeForm : Form {
   int video_skipped_ = 0;
   byte[] video_packet_ = new byte[20 + VideoRowsPerPacket * VideoWidth * 3];
 
-  void OnColourFrame(object sender, ColorImageFrameReadyEventArgs e) {
+  void OnColourFrameWork(ColorImageFrameReadyEventArgs e) {
     using (ColorImageFrame frame = e.OpenColorImageFrame()) {
       if (frame == null || frame.Width != VideoWidth ||
           frame.Height != VideoHeight || video_pixels_ == null) {
         return;
       }
+      CountMade(frame.FrameNumber, ref last_colour_number_, ref colour_made_);
       System.Threading.Interlocked.Increment(ref colour_arrived_);
       if (video_busy_) {
         System.Threading.Interlocked.Increment(ref colour_busy_);
@@ -1413,7 +1528,7 @@ class BridgeForm : Form {
     }
   }
 
-  protected override void OnPaint(PaintEventArgs e) {
+  void PaintWork(PaintEventArgs e) {
     Graphics g = e.Graphics;
     g.InterpolationMode = InterpolationMode.NearestNeighbor;
     g.DrawImage(depth_bitmap_,

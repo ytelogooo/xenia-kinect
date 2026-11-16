@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -864,6 +865,42 @@ class SkeletonReceiver {
     return true;
   }
 
+  // For the emulated camera's colour frames: the next camera picture in the
+  // order they came, one per frame. The bridge and the camera both run at 30
+  // a second on their own clocks; taking just the newest, a frame now and
+  // then saw no new picture and the next one skipped one, and for a while
+  // after the two clocks lined up (every few minutes) up to a third of the
+  // frames repeated a picture (choppy Autodance clips). Kept a picture
+  // behind, the next one is usually there already. sequence counts the
+  // pictures handed out.
+  bool NextCameraColour(std::shared_ptr<const std::vector<uint8_t>>* bgr,
+                        uint32_t* width, uint32_t* height, double max_age_s,
+                        uint32_t* sequence) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!colour_ ||
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      colour_received_)
+                .count() > max_age_s) {
+      colour_queue_.clear();
+      camera_colour_.reset();
+      return false;
+    }
+    // At most one picture waiting after this one: no growing delay.
+    while (colour_queue_.size() > 2) {
+      colour_queue_.pop_front();
+    }
+    if (!colour_queue_.empty()) {
+      camera_colour_ = colour_queue_.front();
+      colour_queue_.pop_front();
+      ++camera_sequence_;
+    }
+    *bgr = camera_colour_ ? camera_colour_ : colour_;
+    *width = colour_width_;
+    *height = colour_height_;
+    *sequence = camera_sequence_;
+    return true;
+  }
+
   // Camera pictures since the last call: complete ones, ones published with
   // rows missing (lost packets: those rows keep the picture before's), and
   // ones dropped because their last rows never came.
@@ -997,6 +1034,10 @@ class SkeletonReceiver {
         std::make_shared<std::vector<uint8_t>>(pending_colour_);
     std::lock_guard<std::mutex> lock(mutex_);
     ++colour_sequence_;
+    colour_queue_.push_back(colour);
+    while (colour_queue_.size() > 4) {
+      colour_queue_.pop_front();
+    }
     colour_ = std::move(colour);
     colour_width_ = width;
     colour_height_ = height;
@@ -1304,6 +1345,9 @@ class SkeletonReceiver {
   std::chrono::steady_clock::time_point colour_received_;
   bool logged_first_colour_ = false;
   uint32_t colour_sequence_ = 0;
+  std::deque<std::shared_ptr<const std::vector<uint8_t>>> colour_queue_;
+  std::shared_ptr<const std::vector<uint8_t>> camera_colour_;
+  uint32_t camera_sequence_ = 0;
   uint32_t pending_colour_frame_ = 0;  // receive thread only
   uint32_t pending_colour_rows_ = 0;   // receive thread only
   std::atomic<uint32_t> colour_complete_{0};
@@ -1433,7 +1477,7 @@ uint32_t WriteBridgeColourFrame(uint8_t* out, uint32_t size, bool window,
   RequestWholeColourIfUnused();
   std::shared_ptr<const std::vector<uint8_t>> colour;
   uint32_t colour_width, colour_height, sequence = 0;
-  const bool have_colour = SkeletonReceiver::Get().LatestColour(
+  const bool have_colour = SkeletonReceiver::Get().NextCameraColour(
       &colour, &colour_width, &colour_height, 0.5, &sequence);
   // Every 5 s: how many camera pictures came from the bridge (and how many
   // were incomplete), and how many of the game's colour frames had a new one
