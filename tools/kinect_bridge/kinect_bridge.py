@@ -90,6 +90,47 @@ def open_camera(index, width, height):
     return cap
 
 
+class LatestFrame:
+    """Reads the camera on its own thread and keeps only the newest frame.
+
+    Read directly, a camera (or a phone camera app's driver) queues frames
+    while tracking takes longer than a frame, and the bridge then works on
+    pictures that are a few frames old: a delay that never catches up.
+    """
+
+    def __init__(self, cap):
+        self.cap = cap
+        self.condition = threading.Condition()
+        self.frame = None
+        self.number = 0
+        self.taken = 0
+        self.stopped = False
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self):
+        while True:
+            ok, frame = self.cap.read()
+            with self.condition:
+                if not ok:
+                    self.stopped = True
+                    self.condition.notify_all()
+                    return
+                self.frame = frame
+                self.number += 1
+                self.condition.notify_all()
+
+    def read(self, timeout=5.0):
+        """The newest frame not handed out yet (waits for one)."""
+        with self.condition:
+            self.condition.wait_for(
+                lambda: self.stopped or self.number != self.taken, timeout)
+            if self.stopped or self.number == self.taken:
+                return False, None, 0
+            dropped = self.number - self.taken - 1
+            self.taken = self.number
+            return True, self.frame, dropped
+
+
 def camera_delivers_picture(cap, attempts=8, time_limit=4.0):
     """True if the camera returns frames that aren't all black."""
     start = time.monotonic()
@@ -495,11 +536,14 @@ def main():
     last_ts = -1
     last_good = None
     fps, fps_time, fps_frames = 0.0, time.monotonic(), 0
+    skipped, skipped_rate = 0, 0.0
+    reader = LatestFrame(cap)
     print(f"Sending skeletons to {target[0]}:{target[1]}. Press Q in the "
           "preview window to quit.")
 
     while True:
-        ok, frame = cap.read()
+        ok, frame, dropped = reader.read()
+        skipped += dropped
         if not ok:
             print("Camera stopped delivering frames.")
             break
@@ -571,7 +615,8 @@ def main():
         now = time.monotonic()
         if now - fps_time >= 1.0:
             fps = fps_frames / (now - fps_time)
-            fps_time, fps_frames = now, 0
+            skipped_rate = skipped / (now - fps_time)
+            fps_time, fps_frames, skipped = now, 0, 0
 
         if not args.no_preview:
             if joints is not None:
@@ -580,6 +625,10 @@ def main():
                 text = (f"tracked  dist {hip[2]:.2f} m  side {hip[0]:+.2f} m  "
                         f"hips {hip[1] + EMULATED_SENSOR_HEIGHT_M:.2f} m  "
                         f"{fps:.0f} fps")
+                if skipped_rate >= 0.5:
+                    # Tracking slower than the camera: older frames skipped
+                    # so the picture stays current.
+                    text += f" (+{skipped_rate:.0f} skipped)"
                 color = (0, 255, 0)
             else:
                 text = f"no player  {fps:.0f} fps"

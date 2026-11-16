@@ -39,6 +39,9 @@ class Options {
   // camera frame is sent (2 = 15 per second).
   public bool SendColour = true;
   public int ColourEvery = 2;
+  // --log FILE: the status rates once a second (camera pictures, skeleton
+  // frames), to read after playing.
+  public string LogPath = null;
   // Send a square around the player's head instead of the whole camera image
   // (what the games show in the player slot); FaceSize is its width in metres.
   public bool FaceCrop = true;
@@ -92,6 +95,9 @@ class Options {
                  next != null) {
         o.ColourEvery = Math.Max(1, Math.Min(10,
             int.Parse(next, CultureInfo.InvariantCulture)));
+        ++i;
+      } else if (a == "--log" && next != null) {
+        o.LogPath = next;
         ++i;
       } else if (a == "--no-depth") {
         o.SendDepth = false;
@@ -235,11 +241,16 @@ class BridgeForm : Form {
   int skeleton_frames_ = 0;
   DateTime rate_start_ = DateTime.Now;
   double rate_ = 0;
+  // Camera pictures per second: from the Kinect, sent to Xenia, and skipped
+  // because the one before was still being sent.
+  int colour_arrived_ = 0, colour_busy_ = 0, colour_sent_ = 0;
+  double colour_in_rate_ = 0, colour_sent_rate_ = 0, colour_busy_rate_ = 0;
+  string camera_text_ = "";
 
   public BridgeForm(Options options) {
     options_ = options;
     Text = "Kinect SDK bridge -> Xenia (UDP " + options.Port + ")";
-    ClientSize = new Size(DepthWidth * 2, DepthHeight * 2 + 60);
+    ClientSize = new Size(DepthWidth * 2, DepthHeight * 2 + 84);
     DoubleBuffered = true;
     BackColor = Color.Black;
     KeyPreview = true;
@@ -642,6 +653,54 @@ class BridgeForm : Form {
       rate_ = skeleton_frames_ / elapsed;
       skeleton_frames_ = 0;
       rate_start_ = DateTime.Now;
+      colour_in_rate_ =
+          System.Threading.Interlocked.Exchange(ref colour_arrived_, 0) /
+          elapsed;
+      colour_busy_rate_ =
+          System.Threading.Interlocked.Exchange(ref colour_busy_, 0) / elapsed;
+      colour_sent_rate_ =
+          System.Threading.Interlocked.Exchange(ref colour_sent_, 0) / elapsed;
+      // The Kinect lengthens the exposure (and so the time between
+      // pictures) when the room is dark.
+      try {
+        ColorCameraSettings cs = sensor_ != null
+                                     ? sensor_.ColorStream.CameraSettings
+                                     : null;
+        camera_text_ =
+            cs == null ? ""
+                       : "   Camera: exposure " +
+                             cs.ExposureTime.ToString(
+                                 "0", CultureInfo.InvariantCulture) +
+                             " ms, a picture every " +
+                             cs.FrameInterval.ToString(
+                                 "0", CultureInfo.InvariantCulture) +
+                             " ms" + (cs.AutoExposure ? " (auto)" : "");
+      } catch (Exception) {
+        camera_text_ = "";
+      }
+      if (options_.LogPath != null) {
+        try {
+          System.IO.File.AppendAllText(
+              options_.LogPath,
+              DateTime.Now.ToString("HH:mm:ss",
+                                    CultureInfo.InvariantCulture) +
+                  "  skeleton frames/s " +
+                  rate_.ToString("0", CultureInfo.InvariantCulture) +
+                  "  camera pictures/s: " +
+                  colour_in_rate_.ToString("0",
+                                           CultureInfo.InvariantCulture) +
+                  " from the Kinect, " +
+                  colour_sent_rate_.ToString("0",
+                                             CultureInfo.InvariantCulture) +
+                  " sent, " +
+                  colour_busy_rate_.ToString("0",
+                                             CultureInfo.InvariantCulture) +
+                  " skipped (still sending)" +
+                  (XeniaWantsWhole() ? "  whole picture" : "  face crop") +
+                  camera_text_ + Environment.NewLine);
+        } catch (Exception) {
+        }
+      }
     }
 
     ApplyGameChoice();
@@ -1014,7 +1073,12 @@ class BridgeForm : Form {
           frame.Height != VideoHeight || video_pixels_ == null) {
         return;
       }
-      if (video_busy_ || ++video_skipped_ < options_.ColourEvery) {
+      System.Threading.Interlocked.Increment(ref colour_arrived_);
+      if (video_busy_) {
+        System.Threading.Interlocked.Increment(ref colour_busy_);
+        return;
+      }
+      if (++video_skipped_ < options_.ColourEvery) {
         return;
       }
       video_skipped_ = 0;
@@ -1154,6 +1218,7 @@ class BridgeForm : Form {
       } catch (SocketException) {
       }
     }
+    System.Threading.Interlocked.Increment(ref colour_sent_);
   }
 
   // The players' outlines. The SDK's player mask often swallows whatever
@@ -1435,6 +1500,17 @@ class BridgeForm : Form {
     using (Font font = new Font(FontFamily.GenericSansSerif, 10)) {
       g.DrawString(line1, font, Brushes.White, 6, DepthHeight * 2 + 6);
       g.DrawString(line2, font, Brushes.Silver, 6, DepthHeight * 2 + 30);
+      if (options_.SendColour) {
+        string line3 =
+            "Camera pictures/s: " +
+            colour_in_rate_.ToString("0", CultureInfo.InvariantCulture) +
+            " from the Kinect, " +
+            colour_sent_rate_.ToString("0", CultureInfo.InvariantCulture) +
+            " sent to Xenia, " +
+            colour_busy_rate_.ToString("0", CultureInfo.InvariantCulture) +
+            " skipped (still sending the one before)" + camera_text_;
+        g.DrawString(line3, font, Brushes.Silver, 6, DepthHeight * 2 + 54);
+      }
     }
   }
 

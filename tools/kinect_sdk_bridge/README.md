@@ -55,6 +55,8 @@ second). Just Dance shows your face in the player slots before a song; Xenia
 writes the picture into the game's colour stream (`[Kernel]
 kinect_live_colour`; `kinect_live_colour_mirror` flips it). `--no-colour`
 turns it off and `--colour-every 3` sends fewer frames.
+`--log FILE` writes the camera picture and skeleton rates to FILE once a
+second, to check afterwards (for example whether the Kinect slowed down).
 
 The camera image is cropped to a square around your head (found with the SDK's
 skeleton-to-colour mapping), because on a console the NUI runtime delivers the

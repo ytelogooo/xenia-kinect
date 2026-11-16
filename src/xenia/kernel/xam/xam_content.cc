@@ -7,6 +7,9 @@
  ******************************************************************************
  */
 
+#include <fstream>
+
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/string_util.h"
@@ -485,6 +488,68 @@ dword_result_t XamContentCreateInternal_entry(
 }
 DECLARE_XAM_EXPORT1(XamContentCreateInternal, kContent, kImplemented);
 
+// A package inside a disc image (or another container) can't be mounted
+// where it is: copy it to cache_root\xcontent\<title ID>\ once and mount
+// the copy. Kinect games read game:\Database.xmplr (the skeleton tracking
+// data, tens of MB) this way, so from an ISO the NUI runtime never started.
+static std::filesystem::path CopyPackageToHost(vfs::Entry* entry) {
+  const std::filesystem::path folder =
+      kernel_state()->emulator()->cache_root() / "xcontent" /
+      fmt::format("{:08X}", kernel_state()->emulator()->title_id());
+  const std::filesystem::path host_path =
+      folder / xe::to_path(std::string(entry->name()));
+  std::error_code error;
+  if (std::filesystem::exists(host_path, error) &&
+      std::filesystem::file_size(host_path, error) == entry->size()) {
+    return host_path;  // copied on an earlier run
+  }
+  std::filesystem::create_directories(folder, error);
+  vfs::File* file = nullptr;
+  if (entry->Open(vfs::FileAccess::kFileReadData, &file) != X_STATUS_SUCCESS ||
+      !file) {
+    XELOGE("XamContentOpenFile: cannot open '{}' to copy it", entry->path());
+    return {};
+  }
+  std::filesystem::path partial = host_path;
+  partial += ".part";
+  bool ok = true;
+  {
+    std::ofstream out(partial, std::ios::binary | std::ios::trunc);
+    std::vector<uint8_t> buffer(4 * 1024 * 1024);
+    size_t offset = 0;
+    ok = bool(out);
+    while (ok && offset < entry->size()) {
+      const size_t chunk = std::min(buffer.size(), entry->size() - offset);
+      size_t read = 0;
+      if (file->ReadSync(std::span<uint8_t>(buffer.data(), chunk), offset,
+                         &read) != X_STATUS_SUCCESS ||
+          !read) {
+        ok = false;
+        break;
+      }
+      out.write(reinterpret_cast<const char*>(buffer.data()),
+                std::streamsize(read));
+      ok = bool(out);
+      offset += read;
+    }
+  }
+  file->Destroy();
+  if (ok) {
+    std::filesystem::rename(partial, host_path, error);
+    ok = !error;
+  }
+  if (!ok) {
+    std::filesystem::remove(partial, error);
+    XELOGE("XamContentOpenFile: copying '{}' to {} failed", entry->path(),
+           xe::path_to_utf8(host_path));
+    return {};
+  }
+  XELOGI("XamContentOpenFile: copied '{}' ({} bytes) out of the disc image to "
+         "{}",
+         entry->path(), entry->size(), xe::path_to_utf8(host_path));
+  return host_path;
+}
+
 dword_result_t XamContentOpenFile_entry(
     dword_t user_index, lpstring_t root_name, lpstring_t path, dword_t flags,
     lpdword_t disposition_ptr, lpdword_t license_mask_ptr,
@@ -500,18 +565,21 @@ dword_result_t XamContentOpenFile_entry(
   X_RESULT result = X_ERROR_FILE_NOT_FOUND;
   vfs::Entry* entry = kernel_state()->file_system()->ResolvePath(guest_path);
   auto* host_entry = dynamic_cast<vfs::HostPathEntry*>(entry);
+  std::filesystem::path package_path;
+  if (host_entry) {
+    package_path = host_entry->host_path();
+  } else if (entry) {
+    // In a disc image (ISO) or another container.
+    package_path = CopyPackageToHost(entry);
+  }
   if (!entry) {
     result = X_ERROR_FILE_NOT_FOUND;
-  } else if (!host_entry) {
-    // TODO: packages inside disc images/containers are not supported yet.
-    XELOGW("XamContentOpenFile: '{}' is not a host file; extract the game "
-           "to a folder to use it",
-           guest_path);
-    result = X_ERROR_FILE_NOT_FOUND;
+  } else if (package_path.empty()) {
+    result = X_ERROR_FUNCTION_FAILED;
   } else if (kernel_state()->content_manager()->IsContentOpen(name)) {
     result = X_ERROR_ALREADY_EXISTS;
   } else if (kernel_state()->content_manager()->OpenAndMountPackage(
-                 host_entry->host_path(), name)) {
+                 package_path, name)) {
     result = X_ERROR_SUCCESS;
   } else {
     result = X_ERROR_FUNCTION_FAILED;
