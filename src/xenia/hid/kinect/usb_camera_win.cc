@@ -143,13 +143,15 @@ static_assert(sizeof(PacketHeader) == 12);
 // Assembles frames from isochronous packets of one stream.
 class FrameAssembler {
  public:
-  FrameAssembler(uint8_t flag, size_t frame_bytes,
+  FrameAssembler(const char* name, uint8_t flag, size_t frame_bytes,
                  const std::function<void()>* on_frame)
-      : flag_(flag), frame_bytes_(frame_bytes), on_frame_(on_frame) {
+      : name_(name), flag_(flag), frame_bytes_(frame_bytes),
+        on_frame_(on_frame) {
     building_.reserve(frame_bytes);
   }
 
   void AddPacket(const uint8_t* packet, size_t length) {
+    ++packets_;
     if (length < sizeof(PacketHeader)) {
       return;
     }
@@ -157,7 +159,19 @@ class FrameAssembler {
     if (std::memcmp(header->magic, kCameraMagic, sizeof(kCameraMagic)) != 0) {
       return;
     }
+    // Once, if the camera streams but no frame ever comes together (seen with
+    // the color stream once): what arrives instead.
+    if (!latest_sequence_ && !reported_ && packets_ >= 20000) {
+      reported_ = true;
+      XELOGW("Kinect: no {} frame yet after {} packets: {} with the camera's "
+             "header, {} frame starts (flag {:02X}), last flag {:02X}, {} "
+             "frames of a wrong size (last {} bytes, expected {})",
+             name_, packets_, headed_, starts_, flag_ | kPacketFrameStart,
+             header->flag, wrong_size_, last_size_, frame_bytes_);
+    }
+    ++headed_;
     if (header->flag == (flag_ | kPacketFrameStart)) {
+      ++starts_;
       building_.clear();
       synced_ = true;
     } else if (!synced_ ||
@@ -170,13 +184,18 @@ class FrameAssembler {
                      packet + length);
     if (building_.size() > frame_bytes_) {
       // Drops a frame that is longer than expected.
+      ++wrong_size_;
+      last_size_ = building_.size();
       building_.clear();
       synced_ = false;
       return;
     }
     if (header->flag == (flag_ | kPacketFrameEnd)) {
       synced_ = false;
-      if (building_.size() == frame_bytes_) {
+      if (building_.size() != frame_bytes_) {
+        ++wrong_size_;
+        last_size_ = building_.size();
+      } else {
         {
           std::lock_guard<xe_mutex> lock(mutex_);
           latest_.swap(building_);
@@ -199,8 +218,12 @@ class FrameAssembler {
   }
 
  private:
+  const char* const name_;
   const uint8_t flag_;
   const size_t frame_bytes_;
+  uint64_t packets_ = 0, headed_ = 0, starts_ = 0, wrong_size_ = 0;
+  size_t last_size_ = 0;
+  bool reported_ = false;
   const std::function<void()>* const on_frame_;
   bool synced_ = false;
   uint8_t sequence_ = 0;
@@ -265,7 +288,10 @@ class UsbCameraWin : public UsbCamera {
       return false;
     }
     if (!StartIso(kColorEndpoint, color_) ||
-        !WriteRegisters({{0x0C, 0x00},      // Bayer.
+        !WriteRegisters({{0x05, 0x00},      // Stop color (as libfreenect
+                                            // does; it may still run from
+                                            // whoever had the camera).
+                         {0x0C, 0x00},      // Bayer.
                          {0x0D, 0x01},      // 640x480.
                          {0x0E, 0x1E},      // 30 fps.
                          {0x05, 0x01},      // Start color.
@@ -522,8 +548,10 @@ class UsbCameraWin : public UsbCamera {
   uint16_t tag_ = 0;
   UsbCameraCalibration calibration_;
   std::function<void()> on_frame_;
-  FrameAssembler depth_frames_{kDepthStreamFlag, kDepthFrameBytes, &on_frame_};
-  FrameAssembler color_frames_{kColorStreamFlag, kColorFrameBytes, &on_frame_};
+  FrameAssembler depth_frames_{"depth", kDepthStreamFlag, kDepthFrameBytes,
+                               &on_frame_};
+  FrameAssembler color_frames_{"color", kColorStreamFlag, kColorFrameBytes,
+                               &on_frame_};
   IsoStream depth_;
   IsoStream color_;
   std::atomic<bool> running_ = false;

@@ -3150,8 +3150,8 @@ void TrackedSkeletonsHookHandler(cpu::ppc::PPCContext_s* ctx,
     return;
   }
   const uint32_t ids = uint32_t(ctx->r[3]);
-  if (!ids) {
-    return;
+  if (!ids || usb_kinect::IsActive()) {
+    return;  // a real Kinect's runtime does the tracking itself
   }
   const uint32_t first = xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(ids));
   const uint32_t second =
@@ -3182,12 +3182,16 @@ void TrackedSkeletonsHookHandler(cpu::ppc::PPCContext_s* ctx,
     return;
   }
   const bool sent = SkeletonReceiver::Get().ChooseSkeletons(first, second);
+  // Remembered either way, so an unchanged pick isn't news (it was logged on
+  // every call without a bridge); unsent, it goes out once one turns up.
+  last_first = first;
+  last_second = second;
   if (sent) {
-    last_first = first;
-    last_second = second;
     last_sent = now;
   }
-  if (changed && changes++ < 200) {
+  static bool logged_no_bridge = false;
+  if (changed && (sent || !logged_no_bridge) && changes++ < 200) {
+    logged_no_bridge |= !sent;
     XELOGI("NUI skeleton: {} asks for full skeletons for tracking IDs {} and "
            "{} -> {}",
            hook->title, first, second,
